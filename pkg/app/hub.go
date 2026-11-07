@@ -365,9 +365,8 @@ func (h *sessionHub) setSegment(seg tui.Segment) {
 	} else {
 		h.vm.segments[seg.Key] = seg
 	}
-	h.publishStatusLocked(ctl.StatusData{Segment: &ctl.Segment{
-		Key: seg.Key, Text: seg.Text, Short: seg.Short, Order: seg.Order,
-	}})
+	wire := ctlSegment(seg)
+	h.publishStatusLocked(ctl.StatusData{Segment: &wire})
 	h.mu.Unlock()
 }
 

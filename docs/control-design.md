@@ -106,6 +106,8 @@ Further rules follow from the single path:
   `/settings` use, through a console seam the driver installs on the hub before dispatch
   starts. The tool rule is the `/tools` dispatch branch itself and settings validation is
   the table the menu editors share, so a remote change can never drift from a typed one.
+  `agents.stop` rides that same seam onto the sub-agent manager's own Stop/StopAll, the
+  implementation `/agents stop` calls, so a remote stop cannot diverge from the keyboard's.
   Model and permission-mode changes stay run-scoped: a controller-driven switch records
   its own entry or drives the barrier live, and never rewrites the user's config layer.
 - **Submitting is not delivering.** A submit during a running turn obeys the pump's

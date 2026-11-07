@@ -1014,6 +1014,40 @@ func TestActivityRow(t *testing.T) {
 	})
 }
 
+// Tally publishes with every status segment publish: two running, then both done.
+func TestTallyPublishesBesideStatus(t *testing.T) {
+	t.Parallel()
+
+	g := &gatedProvider{}
+	var mu sync.Mutex // Tally runs from concurrent job goroutines
+	var last Tally
+	m := New(wired(t, Options{
+		Provider: func(llm.Model) (llm.Provider, error) { return g, nil },
+		Tally:    func(tc Tally) { mu.Lock(); last = tc; mu.Unlock() },
+	}))
+	t.Cleanup(m.Close)
+
+	m.start("one", "", "")
+	m.start("two", "", "")
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return last.Running == 2 && last.Queued == 0
+	}, 2*time.Second, 5*time.Millisecond)
+
+	g.releaseAll()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return last.Done == 2 && last.Running == 0
+	}, 2*time.Second, 5*time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, Tally{Done: 2}, last)
+	assert.Equal(t, map[string]int{"running": 0, "queued": 0, "done": 2}, last.Counts())
+}
+
 func TestStatusSegmentAndList(t *testing.T) {
 	t.Parallel()
 

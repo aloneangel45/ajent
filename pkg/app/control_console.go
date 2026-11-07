@@ -8,6 +8,7 @@ import (
 	"github.com/jentfoo/ajent/pkg/ctl"
 	"github.com/jentfoo/ajent/pkg/llm"
 	"github.com/jentfoo/ajent/pkg/permit"
+	"github.com/jentfoo/ajent/pkg/subagent"
 )
 
 // toolsSet reshapes the enabled tool set through the /tools apply: free
@@ -155,6 +156,60 @@ func (s *controlServer) settingsSet(params []byte) (any, *ctl.Error) {
 	return ctl.SettingsSetResult{Row: ctlSettingRow(row)}, nil
 }
 
+// agentsList lists sub-agent jobs exactly as /agents list renders them, so a
+// controller manages investigations without riding the prompt line. Read-only:
+// it answers any connection.
+func (s *controlServer) agentsList([]byte) (any, *ctl.Error) {
+	a := s.agents()
+	if a == nil {
+		return nil, ctl.Errf(ctl.CodeUnavailable, "sub-agents not available")
+	}
+	jobs := a.List()
+	out := make([]ctl.AgentJob, len(jobs))
+	for i, j := range jobs {
+		out[i] = ctl.AgentJob{ID: j.ID, Task: j.Task, Status: j.Status,
+			ElapsedMS: j.Elapsed.Milliseconds()}
+	}
+	return ctl.AgentsListResult{Jobs: out}, nil
+}
+
+// agentsStop stops one job by id or every in-flight job with all, through the
+// same seam /agents uses. A stopped job reports aborted, never done.
+func (s *controlServer) agentsStop(params []byte) (any, *ctl.Error) {
+	var p ctl.AgentsStopParams
+	if rerr := decodeParams(params, &p); rerr != nil {
+		return nil, rerr
+	}
+	id := strings.TrimSpace(p.ID)
+	if p.All == (id != "") {
+		return nil, ctl.Errf(ctl.CodeBadRequest, "agents.stop takes exactly one of id or all")
+	}
+	a := s.agents()
+	if a == nil {
+		return nil, ctl.Errf(ctl.CodeUnavailable, "sub-agents not available")
+	}
+	if p.All {
+		return ctl.AgentsStopResult{Stopped: a.StopAll()}, nil
+	}
+	if err := a.Stop(id); err != nil {
+		if errors.Is(err, subagent.ErrNoSuchAgent) {
+			return nil, ctl.Errf(ctl.CodeNotFound, "agents.stop: %v", err)
+		}
+		// a finished job cannot be stopped again
+		return nil, ctl.Errf(ctl.CodeUnavailable, "agents.stop: %v", err)
+	}
+	return ctl.AgentsStopResult{Stopped: 1}, nil
+}
+
+// agents returns the sub-agent seam /agents uses, nil when wiring is missing.
+func (s *controlServer) agents() command.Agents {
+	c := s.hub.consoleOf()
+	if c == nil {
+		return nil
+	}
+	return c.Agents()
+}
+
 // gateRefusal returns why key cannot be edited while no permission gate
 // exists, "" when it may.
 func (s *controlServer) gateRefusal(key string) string {
@@ -215,4 +270,12 @@ func (c *controlConn) settingsGetCall(params []byte) (any, *ctl.Error) {
 
 func (c *controlConn) settingsSetCall(params []byte) (any, *ctl.Error) {
 	return c.srv.settingsSet(params)
+}
+
+func (c *controlConn) agentsListCall(params []byte) (any, *ctl.Error) {
+	return c.srv.agentsList(params)
+}
+
+func (c *controlConn) agentsStopCall(params []byte) (any, *ctl.Error) {
+	return c.srv.agentsStop(params)
 }

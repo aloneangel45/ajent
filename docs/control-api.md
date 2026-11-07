@@ -149,19 +149,21 @@ caller picks among them rather than guessing. An empty target means every live i
 
 ## Methods
 
-`state.get`, `models.get` and `settings.get` answer any connection. `attach` is callable
-from any connection at any time and
+`state.get`, `models.get`, `settings.get` and `agents.list` answer any connection.
+`attach` is callable from any connection at any time and
 is how a connection takes or keeps the seat. Every other method requires the control seat,
 so an observer's write refuses with code `observer`. Mutating verbs serialize on one lane,
 where guards revalidate at execution time rather than at request time and a reply follows the
 effects it acknowledges. `interrupt` jumps that queue. `interaction.resolve` needs the seat
 but runs off the lane, because its first resolution wins against local surfaces.
+`agents.stop` stays off the lane too: stops serialize inside the sub-agent manager.
 
 | method | params → result | seat | lane |
 |---|---|---|---|
 | `state.get` | none → `State` snapshot | no | no |
 | `models.get` | none → `{active, models}` | no | no |
 | `settings.get` | none → `{rows}` | no | no |
+| `agents.list` | none → `{jobs}` | no | no |
 | `attach` | `{control?, holder?, force?}` → `{control}` | claims it | no |
 | `submit` | `{line, pendingId?}` → void | yes | yes |
 | `interrupt` | none → `{stopped?}` | yes | yes, priority |
@@ -173,11 +175,17 @@ but runs off the lane, because its first resolution wins against local surfaces.
 | `tools.set` | `{names}` → `{rows}` | yes | yes |
 | `model.set` | `{model}` → `{model}` | yes | yes |
 | `settings.set` | `{key, value, persist?}` → `{row}` | yes | yes |
+| `agents.stop` | `{id? \| all}` → `{stopped}` | yes | no |
 
 Params and results with their wire keys:
 
 - **`state.get`** → one snapshot object, documented in [Snapshots](#snapshots). The reply's
   `seq` is the snapshot's own number.
+- **`agents.list`** lists every sub-agent job exactly as `/agents list` renders them:
+  `{jobs: [{id, task?, status, elapsedMs?}]}` in job-number order (`sub-1`, ..., `sub-10`),
+  finished ones included. `task` is the single-line label and `elapsedMs` the queue wait for
+  a job that never ran, else its runtime frozen once finished. A session with no sub-agent
+  wiring refuses `unavailable`. Read-only: it answers any connection.
 - **`models.get`** lists the model registry exactly as the running process resolved it
   (config plus discovery, no compiled entries), so a controller renders a picker without
   riding one. `{active}` names the model now in effect and each entry of `models` is the
@@ -274,6 +282,12 @@ Params and results with their wire keys:
   `permissions.mode`, which never does. `persist`, when set, also copies the value to a
   config file layer (`user` or `project`) exactly as the `/settings` save prompt would.
   The reply carries the row after the change.
+- **`agents.stop`** stops one job by id or every in-flight job with `all`, through the same
+  seam `/agents stop` uses. Exactly one of `id` or `all` applies; both or neither is
+  `bad-request`. The reply's `{stopped}` counts jobs actually cancelled, for `all` only
+  the ones still in flight. A stopped job reports `aborted`, never done, and Esc never
+  cancels jobs. An unknown id is `not-found`; a finished one (done or errored) refuses
+  `unavailable`, since it cannot stop again.
 
 ## Events
 
@@ -324,7 +338,9 @@ Rendering rules a controller needs:
 
 - **Keyed families replace, empty text removes.** A `status` segment and an `activity` row
   carry a key. Setting non-empty text adds or replaces that row, and empty text reports its
-  removal. An unkeyed `notice` prints, while a keyed one (`key` set) replaces in place instead
+  removal. A segment may carry `counts`, machine-readable tallies beside its prose (the
+  subagents segment publishes `running`, `queued` and `done`) that replace whole with the
+  text. An unkeyed `notice` prints, while a keyed one (`key` set) replaces in place instead
   of stacking. The same applies to `tool.*`, keyed by call id: a header commits once its result
   or first output arrives.
 - **Tolerate events for state you never saw.** `tool.progress` reports arguments that are still
@@ -368,7 +384,7 @@ reply's `seq` is the snapshot's own number: head and view-model fields were take
 | `queued` | count of pending prompts | follows `queued` rows |
 | `queuedRows` | `[{id, text}]`, oldest first, secrets redacted to empty text | `queued` (full replacement) |
 | `activity` | `[{key, text, rank}]` | `activity` per row |
-| `status.segments` | `[{key, text, short, order}]` | `status.segment` per key |
+| `status.segments` | `[{key, text, short, order, counts?}]` | `status.segment` per key |
 | `seat` | `{held, holder?, yours}` reported from your connection's side | none, see below |
 | `interactions` | open dialogs, oldest first, each exactly the pending shape below | `interaction.pending` / `.settled` |
 
@@ -418,6 +434,12 @@ since additions are additive changes.
 - **Dialog kinds** (`kind`): `pick`, `multipick`, `select`, `confirm`, `input`, `secret`,
   `ask`, `decision`. The answer shape to trust comes from the flags, not the kind: `options`
   for `index`, `multi` for `indexes`, `text` for a text answer.
+- **Sub-agent statuses** (`agents.list`): `queued`, `running`, `done`,
+  `error`, `aborted`. A stop turns an in-flight job into `aborted`; it never reports done.
+  Each job's activity row (keyed by its id) carries free prose and clears when the job
+  ends, whatever the outcome.
+- **Status segment tally keys** (`counts`): `running`, `queued`, `done`, matching the
+  subagents segment's prose. A segment without tallies omits `counts`.
 - **Notice levels** (`notice.level`): `info`, `warn`, `error`.
 - **Stop reasons** (`turn.end.stop`): `end_turn`, `tool_use`, `max_tokens`, `incomplete`,
   `aborted`, `error`, and `unknown` when nothing better is known. `turn.end.error` is set on a
@@ -583,6 +605,8 @@ context and surfaces wire refusals unchanged.
 | `Rewind(ctx, head string) (string, error)` | `session.rewind` | the new head id |
 | `QueueRecall(ctx) (ctl.RecallResult, error)` | `queue.recall` | the popped row whole: its `ID` names the queue entry that left, so a controller tracking pending rows resolves them by id. Zero result when nothing was queued |
 | `Resolve(ctx, ctl.ResolveParams) error` | `interaction.resolve` | pass exactly one answer shape with the dialog `ID` |
+| `AgentsList(ctx) (ctl.AgentsListResult, error)` | `agents.list` | every job's id, task label, status and elapsed time, finished ones included |
+| `AgentsStop(ctx, ctl.AgentsStopParams) (ctl.AgentsStopResult, error)` | `agents.stop` | how many jobs were cancelled; pass exactly one of `ID` or `All` |
 | `ReadBranch(path, head string) ([]session.Entry, error)` | package-level | read one transcript file and return its chain under `head`, oldest first, tolerating a torn final line |
 
 Every method in the table above has a typed wrapper. `Call` remains the escape hatch for any

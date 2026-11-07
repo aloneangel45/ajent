@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,6 +17,7 @@ import (
 	"github.com/jentfoo/ajent/pkg/llm"
 	"github.com/jentfoo/ajent/pkg/permit"
 	"github.com/jentfoo/ajent/pkg/session"
+	"github.com/jentfoo/ajent/pkg/subagent"
 	"github.com/jentfoo/ajent/pkg/tokens"
 	"github.com/jentfoo/ajent/pkg/tools"
 )
@@ -363,5 +365,159 @@ func TestControlSettings(t *testing.T) {
 		require.NoError(t, rp.DecodeResult(&res))
 		assert.Equal(t, permit.ModeBlockAll, console.permit.Mode())
 		assert.NotContains(t, settingEntries(t, rig), keyPermissionMode)
+	})
+}
+
+// startControlJob spawns one investigation through the agent_start tool, the
+// path a model takes, and returns its id.
+func startControlJob(t *testing.T, mgr *subagent.Manager) string {
+	t.Helper()
+	for _, tool := range mgr.Tools() {
+		if tool.Name() != "agent_start" {
+			continue
+		}
+		res, err := tool.Execute(t.Context(), agent.ToolCall{
+			Input: json.RawMessage(`{"task":"look around","instructions":""}`),
+		}, agent.NewOutput(agent.NopSink{}, "c"))
+		require.NoError(t, err)
+		dets, ok := res.Details.(map[string]string)
+		require.True(t, ok, "start result missing details")
+		return dets["id"]
+	}
+	t.Fatal("agent_start not registered")
+	return ""
+}
+
+// jobStatus reads one listed job's wire row by id.
+func listedJob(res ctl.AgentsListResult, id string) (ctl.AgentJob, bool) {
+	for _, j := range res.Jobs {
+		if j.ID == id {
+			return j, true
+		}
+	}
+	return ctl.AgentJob{}, false
+}
+
+func TestControlAgents(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
+
+	t.Run("unavailable_without_manager", func(t *testing.T) {
+		rig := newServeRig(t, nil)
+		c := dialControl(t, rig.path)
+		c.hello()
+		wireControlConsole(t, rig) // console wired, no sub-agent manager behind it
+
+		// list answers any connection, so its refusal is the verb's own
+		rp := c.call("l", ctl.MethodAgentsList, map[string]any{})
+		require.NotNil(t, rp.Error)
+		assert.Equal(t, ctl.CodeUnavailable, rp.Error.Code)
+
+		// stop needs the seat before its handler can refuse
+		attachControl(t, c, "agents")
+		rp = c.call("s", ctl.MethodAgentsStop, map[string]any{"all": true})
+		require.NotNil(t, rp.Error)
+		assert.Equal(t, ctl.CodeUnavailable, rp.Error.Code)
+	})
+
+	t.Run("list_answers_observer", func(t *testing.T) {
+		rig := newServeRig(t, nil)
+		c := dialControl(t, rig.path)
+		c.hello() // no attach: list is a read like state.get
+		console := wireControlConsole(t, rig)
+		mgr := newHoldManager(t)
+		console.agents = agentsAdapter{m: mgr}
+
+		id := startControlJob(t, mgr)
+		require.Eventually(t, func() bool {
+			rp := c.call("l", ctl.MethodAgentsList, map[string]any{})
+			require.Nil(t, rp.Error)
+			var res ctl.AgentsListResult
+			require.NoError(t, rp.DecodeResult(&res))
+			j, ok := listedJob(res, id)
+			return ok && j.Status == "running" && j.Task == "look around" && j.ElapsedMS >= 0
+		}, 2*time.Second, 5*time.Millisecond)
+
+		// stop still needs the seat
+		rp := c.call("s", ctl.MethodAgentsStop, map[string]any{"id": id})
+		require.NotNil(t, rp.Error)
+		assert.Equal(t, ctl.CodeObserver, rp.Error.Code)
+	})
+
+	t.Run("stop_reports_aborted_never_done", func(t *testing.T) {
+		rig := newServeRig(t, nil)
+		c := dialControl(t, rig.path)
+		c.hello()
+		attachControl(t, c, "agents")
+		console := wireControlConsole(t, rig)
+		mgr := newHoldManager(t)
+		console.agents = agentsAdapter{m: mgr}
+
+		id := startControlJob(t, mgr)
+
+		rp := c.call("u1", ctl.MethodAgentsStop, map[string]any{"id": "sub-9"})
+		require.NotNil(t, rp.Error)
+		assert.Equal(t, ctl.CodeNotFound, rp.Error.Code)
+
+		rp = c.call("s1", ctl.MethodAgentsStop, map[string]any{"id": id})
+		require.Nil(t, rp.Error)
+		var res ctl.AgentsStopResult
+		require.NoError(t, rp.DecodeResult(&res))
+		assert.Equal(t, 1, res.Stopped) // the job was in flight
+
+		// /agents parity: a stopped job shows aborted and stays listed
+		require.Eventually(t, func() bool {
+			rp := c.call("l", ctl.MethodAgentsList, map[string]any{})
+			require.Nil(t, rp.Error)
+			var lst ctl.AgentsListResult
+			require.NoError(t, rp.DecodeResult(&lst))
+			j, ok := listedJob(lst, id)
+			return ok && j.Status == "aborted"
+		}, 2*time.Second, 5*time.Millisecond)
+
+		// a finished-and-gone id is unknown, exactly as /agents stop reports
+		rp = c.call("u2", ctl.MethodAgentsStop, map[string]any{"id": "sub-42"})
+		require.NotNil(t, rp.Error)
+		assert.Equal(t, ctl.CodeNotFound, rp.Error.Code)
+	})
+
+	t.Run("stop_all_counts_inflight_only", func(t *testing.T) {
+		rig := newServeRig(t, nil)
+		c := dialControl(t, rig.path)
+		c.hello()
+		attachControl(t, c, "agents")
+		console := wireControlConsole(t, rig)
+		mgr := newHoldManager(t)
+		console.agents = agentsAdapter{m: mgr}
+
+		startControlJob(t, mgr)
+		startControlJob(t, mgr)
+
+		rp := c.call("sa", ctl.MethodAgentsStop, map[string]any{"all": true})
+		require.Nil(t, rp.Error)
+		var res ctl.AgentsStopResult
+		require.NoError(t, rp.DecodeResult(&res))
+		assert.Equal(t, 2, res.Stopped)
+
+		// nothing left in flight: a second stop all cancels no one
+		rp = c.call("sa2", ctl.MethodAgentsStop, map[string]any{"all": true})
+		require.Nil(t, rp.Error)
+		require.NoError(t, rp.DecodeResult(&res))
+		assert.Equal(t, 0, res.Stopped)
+	})
+
+	t.Run("neither_id_nor_all_refused", func(t *testing.T) {
+		rig := newServeRig(t, nil)
+		c := dialControl(t, rig.path)
+		c.hello()
+		attachControl(t, c, "agents")
+		wireControlConsole(t, rig)
+
+		rp := c.call("b1", ctl.MethodAgentsStop, map[string]any{})
+		require.NotNil(t, rp.Error)
+		assert.Equal(t, ctl.CodeBadRequest, rp.Error.Code)
+
+		rp = c.call("b2", ctl.MethodAgentsStop, map[string]any{"id": "sub-1", "all": true})
+		require.NotNil(t, rp.Error)
+		assert.Equal(t, ctl.CodeBadRequest, rp.Error.Code)
 	})
 }

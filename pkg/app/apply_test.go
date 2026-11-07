@@ -109,6 +109,17 @@ func TestApplierChromeEvents(t *testing.T) {
 		assert.Equal(t, want, rec.segs[segMCP])
 	})
 
+	t.Run("segment_counts_ride", func(t *testing.T) {
+		rec := newRecSurface()
+		ap := testApplier(t, rec, applyHooks{})
+		ap.Apply(ctl.NewEvent(ctl.EventStatus, 1, ctl.StatusData{Segment: &ctl.Segment{
+			Key: segSubagents, Text: "1 running", Short: "sub 1",
+			Counts: map[string]int{"running": 1}}}))
+		want := segment(segSubagents, "1 running", "sub 1")
+		want.Counts = map[string]int{"running": 1}
+		assert.Equal(t, want, rec.segs[segSubagents])
+	})
+
 	t.Run("segment_removal", func(t *testing.T) {
 		rec := newRecSurface()
 		ap := testApplier(t, rec, applyHooks{})
@@ -237,9 +248,11 @@ func TestApplierSnapshotReconciles(t *testing.T) {
 		ap, rec, _ := newLive(t)
 
 		keepSeg := segment(segHint, "hold on", "")
+		keepSeg.Counts = map[string]int{"running": 1} // tallies survive the snapshot round trip
 		keepAct := "scanning"
 		ap.Snapshot(ctl.State{
-			Status:   ctl.StatusRow{Segments: []ctl.Segment{{Key: keepSeg.Key, Text: keepSeg.Text, Short: keepSeg.Short}}},
+			Status: ctl.StatusRow{Segments: []ctl.Segment{{Key: keepSeg.Key, Text: keepSeg.Text,
+				Short: keepSeg.Short, Counts: keepSeg.Counts}}},
 			Activity: []ctl.ActivityRow{{Key: keepAct, Text: keepAct, Rank: 2}},
 			Idle:     true,
 		})

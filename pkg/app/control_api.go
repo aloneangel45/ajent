@@ -50,8 +50,13 @@ var controlMethods = guardMethods(map[string]controlMethod{
 	ctl.MethodModelSet:    {seat: true, lane: true, handle: (*controlConn).modelSetCall},
 	ctl.MethodSettingsSet: {seat: true, lane: true, handle: (*controlConn).settingsSetCall},
 
+	// stop serializes inside the sub-agent manager and touches no session state,
+	// so like resolve it stays off the lane
+	ctl.MethodAgentsStop: {seat: true, handle: (*controlConn).agentsStopCall},
+
 	ctl.MethodModelsGet:   {handle: (*controlConn).modelsGetCall}, // reads answer any connection
 	ctl.MethodSettingsGet: {handle: (*controlConn).settingsGetCall},
+	ctl.MethodAgentsList:  {handle: (*controlConn).agentsListCall},
 })
 
 // guardMethods wraps every registered handler once, converting a panic into

@@ -190,12 +190,15 @@ type StatusData struct {
 	Spinning *bool       `json:"spinning,omitempty"`
 }
 
-// Segment is one keyed status segment; empty Text reports a removal.
+// Segment is one keyed status segment; empty Text reports a removal. Counts
+// carries machine-readable tallies beside prose when its publisher has them
+// (the subagents segment publishes running, queued and done).
 type Segment struct {
-	Key   string `json:"key"`
-	Text  string `json:"text"`
-	Short string `json:"short,omitempty"`
-	Order int    `json:"order"`
+	Key    string         `json:"key"`
+	Text   string         `json:"text"`
+	Short  string         `json:"short,omitempty"`
+	Order  int            `json:"order"`
+	Counts map[string]int `json:"counts,omitempty"`
 }
 
 // ActivityData publishes one keyed activity row as an event; it is an alias of
@@ -449,6 +452,35 @@ type SettingsSetParams struct {
 // SettingsSetResult reports the row after the change.
 type SettingsSetResult struct {
 	Row SettingRow `json:"row"`
+}
+
+// AgentJob is one sub-agent job as agents.list carries it: the id, its task
+// label, lifecycle status and elapsed time. Status is queued, running, done,
+// error or aborted.
+type AgentJob struct {
+	ID        string `json:"id"`
+	Task      string `json:"task,omitempty"`
+	Status    string `json:"status"`
+	ElapsedMS int64  `json:"elapsedMs,omitempty"`
+}
+
+// AgentsListResult lists every job in job-number order (sub-1, ..., sub-10),
+// finished ones included.
+type AgentsListResult struct {
+	Jobs []AgentJob `json:"jobs"`
+}
+
+// AgentsStopParams names one job to stop by id, or every in-flight job with
+// All. Exactly one of the two applies; both or neither is bad-request.
+type AgentsStopParams struct {
+	ID  string `json:"id,omitempty"`
+	All bool   `json:"all,omitempty"`
+}
+
+// AgentsStopResult reports how many jobs the stop cancelled, zero when none
+// were in flight (or the named one had already finished).
+type AgentsStopResult struct {
+	Stopped int `json:"stopped"`
 }
 
 // SeatLostData announces one force takeover of the control seat: From names

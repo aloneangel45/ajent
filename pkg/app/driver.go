@@ -316,6 +316,9 @@ func Driver(term *tui.UI, set *config.Set, reg *llm.Registry, active llm.Model, 
 	// each a fresh headless loop whose only return value is a final summary.
 	var sag *subagent.Manager
 	if toolsReg != nil {
+		// tally rides the manager's publish serialization: Tally fires immediately
+		// before each Status call, so pairing them needs no lock of our own
+		var tally subagent.Tally
 		sag = subagent.New(subagent.Options{
 			Provider: func(m llm.Model) (llm.Provider, error) { return providers.ProviderFor(m) },
 			Model:    func() llm.Model { return resolveSubAgentModel(set, reg, st) },
@@ -334,7 +337,16 @@ func Driver(term *tui.UI, set *config.Set, reg *llm.Registry, active llm.Model, 
 				ui.SetActivityRanked(key, text, rank)
 			},
 			Notice: func(msg string) { ui.NotifyKeyed("subagent", msg, tui.LevelInfo) },
-			Status: func(text, short string) { ui.SetStatusSegment(segment(segSubagents, text, short)) },
+			Tally:  func(t subagent.Tally) { tally = t },
+			Status: func(text, short string) {
+				// the prose keeps its human shape; counts ride beside it for
+				// controllers that would otherwise parse it
+				seg := segment(segSubagents, text, short)
+				if text != "" {
+					seg.Counts = tally.Counts()
+				}
+				ui.SetStatusSegment(seg)
+			},
 			Deliver: func(in agent.Input) bool {
 				if ag == nil || !ag.Running() { // never start a turn on an idle parent
 					return false

@@ -202,7 +202,9 @@ func (a *applier) Apply(ev ctl.Event) {
 		switch {
 		case d.Segment != nil:
 			// placement comes from this build's spec table, so equal keys collapse alike
-			a.segment(segment(d.Segment.Key, d.Segment.Text, d.Segment.Short))
+			seg := segment(d.Segment.Key, d.Segment.Text, d.Segment.Short)
+			seg.Counts = d.Segment.Counts // tallies ride beside the prose
+			a.segment(seg)
 		case d.Model != nil:
 			a.model(d.Model.Key, d.Model.Short, d.Model.Window)
 		}
@@ -254,8 +256,10 @@ func (a *applier) Snapshot(snap ctl.State) {
 	if snap.Model.Key != "" {
 		a.model(snap.Model.Key, snap.Model.Short, snap.Model.Window)
 	}
-	for _, seg := range snap.Status.Segments {
-		a.segment(segment(seg.Key, seg.Text, seg.Short))
+	for _, s := range snap.Status.Segments {
+		seg := segment(s.Key, s.Text, s.Short)
+		seg.Counts = s.Counts
+		a.segment(seg)
 	}
 	listed := bulk.SliceToSetBy(func(s ctl.Segment) string { return s.Key }, snap.Status.Segments)
 	for _, key := range a.staleKeys(a.segs, listed) {

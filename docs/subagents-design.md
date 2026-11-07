@@ -343,6 +343,11 @@ a newer one. A full form names the running count (with the oldest live job's
 age) and the done count, a short form for narrow rows, cleared when no jobs
 exist. The front end renders it as a keyed status segment.
 
+A structured `Tally` (running, queued, done) publishes immediately before each
+callback through the same serialization, so the host can attach machine-readable
+counts to the segment without parsing the prose. Controllers read those counts
+from the control socket's status segments rather than regexing the text.
+
 ## Accounting and configuration seams
 
 ### Child spend (`pkg/tokens`)
@@ -375,6 +380,8 @@ and barrier exist, with adapters:
 - `Activity` → the UI activity row
 - `Notice` → a keyed UI notice (so consecutive notices collapse in place)
 - `Status` → the UI status segment
+- `Tally` → structured job counts captured beside each Status publish and carried
+  on the segment for control surfaces
 - `Deliver` → the `Running()`-guarded `ag.Steer`, per above
 - `Boundary` → chained ahead of the steer queue's `q.pull` in
   `Options.OnBoundary`, so completion steers and queued user prompts land at the

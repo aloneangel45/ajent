@@ -3,6 +3,7 @@ package subagent
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -29,7 +30,7 @@ const (
 // Options configures a sub-agent Manager. The func-typed fields are supplied
 // at wiring time, so this package never imports pkg/tui or pkg/tools. Root,
 // Model, Reasoning, Parent, Notice, Deliver and Tools are required (a nil Root
-// panics). Activity and Status are optional.
+// panics). Activity, Status and Tally are optional.
 type Options struct {
 	Provider            func(llm.Model) (llm.Provider, error)
 	Model               func() llm.Model           // configured child model, else the session's
@@ -48,6 +49,7 @@ type Options struct {
 	Activity func(key, text string, rank int) // nil disables activity rows
 	Notice   func(msg string)                 // keyed UI notice for completions
 	Status   func(text, short string)
+	Tally    func(Tally)            // structured job counts beside every Status publish; nil skips it
 	Deliver  func(agent.Input) bool // steers into a running parent turn, false when idle
 
 	MaxConcurrent int           // 0 -> defaultMaxConcurrent
@@ -396,16 +398,35 @@ func (m *Manager) List() []Job {
 	return out
 }
 
+// Tally is one publish of job counts, riding beside the prose status segment.
+type Tally struct {
+	Running int
+	Queued  int
+	Done    int
+}
+
+// Counts renders the tally in the status-segment vocabulary: running, queued
+// and done.
+func (t Tally) Counts() map[string]int {
+	return map[string]int{"running": t.Running, "queued": t.Queued, "done": t.Done}
+}
+
+// Stop refusal causes, so callers distinguish them without parsing prose.
+var (
+	ErrNoSuchAgent   = errors.New("no such sub-agent")
+	ErrAgentFinished = errors.New("already finished")
+)
+
 // Stop cancels one job by id (accepts sub-2 or bare 2). A queued or running job is
 // aborted, and a finished one returns an error.
 func (m *Manager) Stop(id string) error {
 	j, ok := m.lookup(id)
 	if !ok {
-		return fmt.Errorf("no such sub-agent %q", id)
+		return fmt.Errorf("%w %q", ErrNoSuchAgent, id)
 	}
 	s := j.statusOf()
 	if s == StatusDone || s == StatusError {
-		return fmt.Errorf("sub-agent %s already finished (%s)", j.id, s)
+		return fmt.Errorf("sub-agent %s %w (%s)", j.id, ErrAgentFinished, s)
 	}
 	j.cancel()
 	return nil
@@ -676,10 +697,12 @@ func (m *Manager) publishActivity(key, text string, rank int) {
 	fn(key, text, rank)
 }
 
-// publishStatus recomputes and pushes the status segment, empty clears it.
+// publishStatus recomputes and pushes the status segment with its structured
+// tally beside it; empty text clears both.
 func (m *Manager) publishStatus() {
 	fn := m.opts.Status
-	if fn == nil {
+	tallyFn := m.opts.Tally
+	if fn == nil && tallyFn == nil {
 		return
 	}
 	m.pubMu.Lock()
@@ -709,6 +732,12 @@ func (m *Manager) publishStatus() {
 	}
 	m.mu.Unlock()
 
+	if tallyFn != nil {
+		tallyFn(Tally{Running: running, Queued: queued, Done: done})
+	}
+	if fn == nil {
+		return
+	}
 	if running == 0 && queued == 0 && done == 0 {
 		fn("", "")
 		return

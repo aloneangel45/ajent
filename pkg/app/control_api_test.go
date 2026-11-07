@@ -63,7 +63,8 @@ func TestControlAttach(t *testing.T) {
 		// every write method refuses the observer, each naming the holder
 		for _, m := range []string{ctl.MethodSubmit, ctl.MethodInterrupt, ctl.MethodModeCycle,
 			ctl.MethodModeSet, ctl.MethodQueueRecall, ctl.MethodRewind,
-			ctl.MethodResolve, ctl.MethodToolsSet, ctl.MethodModelSet, ctl.MethodSettingsSet} {
+			ctl.MethodResolve, ctl.MethodToolsSet, ctl.MethodModelSet, ctl.MethodSettingsSet,
+			ctl.MethodAgentsStop} {
 			rp = two.call("obs-"+m, m, map[string]any{})
 			require.NotNil(t, rp.Error)
 			assert.Equal(t, ctl.CodeObserver, rp.Error.Code)
@@ -157,7 +158,8 @@ func TestControlMethods(t *testing.T) {
 	t.Run("write_methods_require_seat", func(t *testing.T) {
 		for _, m := range []string{ctl.MethodSubmit, ctl.MethodInterrupt, ctl.MethodModeCycle,
 			ctl.MethodModeSet, ctl.MethodQueueRecall, ctl.MethodRewind,
-			ctl.MethodResolve, ctl.MethodToolsSet, ctl.MethodModelSet, ctl.MethodSettingsSet} {
+			ctl.MethodResolve, ctl.MethodToolsSet, ctl.MethodModelSet, ctl.MethodSettingsSet,
+			ctl.MethodAgentsStop} {
 			entry, ok := controlMethods[m]
 			require.True(t, ok)
 			assert.True(t, entry.seat)
@@ -166,7 +168,7 @@ func TestControlMethods(t *testing.T) {
 
 	t.Run("read_methods_stay_open", func(t *testing.T) {
 		for _, m := range []string{ctl.MethodState, ctl.MethodAttach,
-			ctl.MethodModelsGet, ctl.MethodSettingsGet} {
+			ctl.MethodModelsGet, ctl.MethodSettingsGet, ctl.MethodAgentsList} {
 			entry, ok := controlMethods[m]
 			require.True(t, ok)
 			assert.False(t, entry.seat)

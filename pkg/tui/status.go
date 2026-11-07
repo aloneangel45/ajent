@@ -39,6 +39,10 @@ type Segment struct {
 
 	Order    int // display position, ascending. Ties keep insertion order.
 	Priority int // collapse and drop step: 0 goes first, then 1, 2…, negative last
+
+	// Counts carries machine-readable tallies beside prose (subagents publishes
+	// running, queued and done). Never rendered; for control surfaces.
+	Counts map[string]int
 }
 
 // Status is the state rendered on the line below the input field.

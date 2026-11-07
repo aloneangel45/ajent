@@ -212,6 +212,22 @@ func (f *fakeSession) serveConn(conn net.Conn) {
 		case ctl.MethodSettingsGet:
 			_ = enc.Encode(ctl.Reply{ID: req.ID, Result: mustJSON(ctl.SettingsData{Rows: []ctl.SettingRow{
 				{Label: "Block images", Key: "images.block", Value: json.RawMessage("false"), Source: "default", Editable: true}}})})
+		case ctl.MethodAgentsList:
+			_ = enc.Encode(ctl.Reply{ID: req.ID, Result: mustJSON(ctl.AgentsListResult{Jobs: []ctl.AgentJob{
+				{ID: "sub-1", Task: "look around", Status: "running", ElapsedMS: 31000}}})})
+		case ctl.MethodAgentsStop:
+			var p ctl.AgentsStopParams
+			_ = json.Unmarshal(req.Params, &p)
+			if !p.All && p.ID != "sub-1" {
+				_ = enc.Encode(ctl.Reply{ID: req.ID,
+					Error: ctl.Errf(ctl.CodeNotFound, "no such sub-agent %q", p.ID)})
+				continue
+			}
+			n := 1
+			if p.All {
+				n = 2
+			}
+			_ = enc.Encode(ctl.Reply{ID: req.ID, Result: mustJSON(ctl.AgentsStopResult{Stopped: n})})
 		case ctl.MethodSettingsSet:
 			var p ctl.SettingsSetParams
 			_ = json.Unmarshal(req.Params, &p)
@@ -404,6 +420,27 @@ func TestModeSet(t *testing.T) {
 	mode, err := conn.ModeSet(t.Context(), "auto+write")
 	require.NoError(t, err)
 	assert.Equal(t, "auto+write", mode)
+}
+
+func TestAgentsCalls(t *testing.T) {
+	t.Parallel()
+	f := newFakeSession(t)
+	conn, _, _ := f.dial(t)
+
+	jobs, err := conn.AgentsList(t.Context())
+	require.NoError(t, err)
+	require.Len(t, jobs.Jobs, 1)
+	assert.Equal(t, "sub-1", jobs.Jobs[0].ID)
+	assert.Equal(t, "running", jobs.Jobs[0].Status)
+
+	res, err := conn.AgentsStop(t.Context(), ctl.AgentsStopParams{All: true})
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Stopped)
+
+	_, err = conn.AgentsStop(t.Context(), ctl.AgentsStopParams{ID: "missing"})
+	var we *ctl.Error
+	require.ErrorAs(t, err, &we)
+	assert.Equal(t, ctl.CodeNotFound, we.Code)
 }
 
 func TestSettings(t *testing.T) {

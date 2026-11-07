@@ -33,6 +33,12 @@ const (
 	MethodModelSet    = "model.set"
 	MethodSettingsGet = "settings.get"
 	MethodSettingsSet = "settings.set"
+
+	// MethodAgentsList and MethodAgentsStop manage sub-agent jobs over the wire:
+	// /agents list and stop without riding the prompt line. Read-only list
+	// answers any connection; stop needs the seat.
+	MethodAgentsList = "agents.list"
+	MethodAgentsStop = "agents.stop"
 )
 
 // Event names, grouped by family. Stream events mirror the agent sink one to

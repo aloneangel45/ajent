@@ -222,12 +222,15 @@ func TestControlSurfaceParity(t *testing.T) {
 	ui.Notify("plain notice", tui.LevelWarn)
 	ui.NotifyKeyed("subagent", "keyed notice", tui.LevelInfo)
 	ui.SetStatusSegment(segment(segMCP, "mcp 2/2", "2/2"))
+	subSeg := segment(segSubagents, "1 running (oldest 4s)", "sub 1")
+	subSeg.Counts = map[string]int{"running": 1}
+	ui.SetStatusSegment(subSeg)
 	ui.SetModelOf(llm.Model{Provider: "p", ID: "big", ContextWindow: 200000})
 	ui.SetQueued([]ctl.QueueRow{{ID: "row-a", Text: "queued a"}, {ID: "row-b", Text: "queued b"}})
 
 	want := []string{
 		ctl.EventPrint, ctl.EventNotice, ctl.EventNotice,
-		ctl.EventStatus, ctl.EventStatus, ctl.EventQueued,
+		ctl.EventStatus, ctl.EventStatus, ctl.EventStatus, ctl.EventQueued,
 	}
 	all := c.collectEventsAny(t, len(want))
 	names := make([]string, 0, len(all))
@@ -250,6 +253,11 @@ func TestControlSurfaceParity(t *testing.T) {
 	require.NotNil(t, sd.Segment)
 	assert.Equal(t, segMCP, sd.Segment.Key)
 	assert.Equal(t, "mcp 2/2", sd.Segment.Text)
+
+	var subd ctl.StatusData
+	require.NoError(t, matchEvent(t, all, ctl.EventStatus, segSubagents).Decode(&subd))
+	require.NotNil(t, subd.Segment)
+	assert.Equal(t, map[string]int{"running": 1}, subd.Segment.Counts)
 
 	var md ctl.StatusData
 	require.NoError(t, matchEvent(t, all, ctl.EventStatus, "p/big").Decode(&md))

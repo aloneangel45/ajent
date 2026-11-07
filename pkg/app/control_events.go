@@ -8,6 +8,7 @@ import (
 	"github.com/jentfoo/ajent/pkg/ctl"
 	"github.com/jentfoo/ajent/pkg/llm"
 	"github.com/jentfoo/ajent/pkg/session"
+	"github.com/jentfoo/ajent/pkg/tui"
 )
 
 // ctlStreamSink republishes every agent turn event onto the control wire, one
@@ -173,8 +174,7 @@ func ctlStateFrom(s hubSnapshot) ctl.State {
 	if s.Status.Segments != nil {
 		st.Status.Segments = make([]ctl.Segment, len(s.Status.Segments))
 		for i, seg := range s.Status.Segments {
-			st.Status.Segments[i] = ctl.Segment{Key: seg.Key, Text: seg.Text,
-				Short: seg.Short, Order: seg.Order}
+			st.Status.Segments[i] = ctlSegment(seg)
 		}
 	}
 	if s.Interactions != nil {
@@ -193,6 +193,12 @@ func ctlStateFrom(s hubSnapshot) ctl.State {
 		}
 	}
 	return st
+}
+
+// ctlSegment maps one view-model segment onto the wire shape.
+func ctlSegment(seg tui.Segment) ctl.Segment {
+	return ctl.Segment{Key: seg.Key, Text: seg.Text, Short: seg.Short,
+		Order: seg.Order, Counts: seg.Counts}
 }
 
 func ctlStateModel(m hubModel) ctl.ModelState {

@@ -364,6 +364,22 @@ func (c *Conn) Resolve(ctx context.Context, params ctl.ResolveParams) error {
 	return err
 }
 
+// AgentsList lists the session's sub-agent jobs exactly as /agents list does:
+// id, task label, status and elapsed time, finished ones included.
+func (c *Conn) AgentsList(ctx context.Context) (ctl.AgentsListResult, error) {
+	var res ctl.AgentsListResult
+	_, err := c.Call(ctx, ctl.MethodAgentsList, nil, &res)
+	return res, err
+}
+
+// AgentsStop stops one job by id, or every in-flight job with All. Stopped jobs
+// report aborted; a finished target refuses without cancelling anything.
+func (c *Conn) AgentsStop(ctx context.Context, params ctl.AgentsStopParams) (ctl.AgentsStopResult, error) {
+	var res ctl.AgentsStopResult
+	_, err := c.Call(ctx, ctl.MethodAgentsStop, params, &res)
+	return res, err
+}
+
 // finish marks the connection dead exactly once.
 func (c *Conn) finish(err error) {
 	c.once.Do(func() {
