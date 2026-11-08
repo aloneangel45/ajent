@@ -82,8 +82,10 @@ keep that single path honest under concurrent controllers.
   covers that same window: Esc stops the drain, releasing the staged-command
   wait it sits in and recovering its queued prompts, exactly as it stops a
   running turn. Pump lines carry the lane's dispatch generation, which a rewind
-  bumps. The pump returns aged lines to the editor with a notice naming what
-  happened, so a buffered prompt is decided once and never lands by accident.
+  bumps. Aged locally typed lines return to the editor with a notice naming what
+  happened; remote submits resolve their pending row instead, so foreign text
+  never lands in the host draft. Either way a buffered prompt is decided once and
+  never lands by accident.
 - **Rewind is one transaction.** Swapping agent state, moving the writer head and
   publishing the branch change form one ordered operation shared by double-Esc and the
   wire, so live state and the writer head cannot diverge and the last rewind wins no

@@ -132,7 +132,7 @@ func runPump(ctx context.Context, pump <-chan pumpLine, ag *agent.Agent, console
 					// resolve; the queue replaces this at join with the run's ids
 					id := line.queueID
 					in.Dropped = func() {
-						ui.hub.queueDroppedCause("interrupt", []ctl.QueueRow{{ID: id, Text: echo}})
+						ui.QueueDropped("interrupt", []ctl.QueueRow{{ID: id, Text: echo}})
 					}
 				}
 				est := submitEstimate(in, pending)
@@ -256,11 +256,23 @@ func submitEstimate(in agent.Input, pending int) int {
 	return est
 }
 
+// recoverySurface is what an aged-out prompt recovers onto: the hub's drop
+// seam resolving its submitter's pending row, and a local editor when one
+// exists. *hubUI satisfies it.
+type recoverySurface interface {
+	QueueDropped(cause string, rows []ctl.QueueRow)
+	Interactive() bool
+	PrependInput(text string)
+	Notify(msg string, level tui.Level)
+	NotifyLocal(msg string, level tui.Level)
+}
+
 // stalePrompt recovers one dequeued line a rewind aged out: the submitting
-// surface's pending row resolves like any queue exit, the text returns to the
-// editor when one exists, and a serve run drops it with a notice. Never a
-// silent landing on the branch the prompt was not written against.
-func stalePrompt(ui *hubUI, line pumpLine) {
+// surface's pending row resolves like any queue exit, locally typed text
+// returns to the editor when one exists, and remote text or a serve run drops
+// with a notice. Never a silent landing on the branch the prompt was not
+// written against.
+func stalePrompt(ui recoverySurface, line pumpLine) {
 	// only a submitter that sent a correlation holds a pending row to resolve;
 	// a typed line was never announced as a row anywhere
 	id := line.queueID
@@ -268,10 +280,16 @@ func stalePrompt(ui *hubUI, line pumpLine) {
 		id = line.input.QueueIDs[0]
 	}
 	if id != "" {
-		ui.hub.queueDroppedCause(rewindCauseRewind, []ctl.QueueRow{{ID: id, Text: line.rest}})
+		ui.QueueDropped(rewindCauseRewind, []ctl.QueueRow{{ID: id, Text: line.rest}})
 	}
 	if !ui.Interactive() {
 		ui.Notify("queued prompt dropped; the session rewound while it waited", tui.LevelWarn)
+		return
+	}
+	if line.origin != "" {
+		// remote text recovers with its submitter through the row above, never
+		// into the host draft
+		ui.NotifyLocal("controller prompt dropped; the session rewound while it waited", tui.LevelWarn)
 		return
 	}
 	ui.PrependInput(refiledLabel(line.rest, line.blocks))

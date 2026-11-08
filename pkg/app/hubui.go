@@ -118,6 +118,12 @@ func (u *hubUI) SetQueued(rows []ctl.QueueRow) {
 	u.hub.setQueued(rows)
 }
 
+// QueueDropped resolves pending rows a removal cleared through the hub.
+// Report-only: the drop event is its own news, nothing paints locally.
+func (u *hubUI) QueueDropped(cause string, rows []ctl.QueueRow) {
+	u.hub.queueDroppedCause(cause, rows)
+}
+
 // SetIdle flips the prompt's rest state and reports it.
 func (u *hubUI) SetIdle(idle bool) {
 	if u.UI != nil {

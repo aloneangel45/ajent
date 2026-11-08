@@ -406,6 +406,84 @@ func TestRunPump(t *testing.T) {
 	})
 }
 
+// fakeRecoveryUI records what stalePrompt does to the surface it recovers
+// onto. headless models serve mode: no editor exists and every notice reports.
+type fakeRecoveryUI struct {
+	headless  bool
+	drops     []ctl.QueueDroppedData
+	prepended []string
+	reports   []string // Notify texts, wire-reported
+	locals    []string // NotifyLocal texts, local chrome only
+}
+
+func (f *fakeRecoveryUI) QueueDropped(cause string, rows []ctl.QueueRow) {
+	f.drops = append(f.drops, ctl.QueueDroppedData{Rows: rows, Cause: cause})
+}
+func (f *fakeRecoveryUI) Interactive() bool                   { return !f.headless }
+func (f *fakeRecoveryUI) PrependInput(text string)            { f.prepended = append(f.prepended, text) }
+func (f *fakeRecoveryUI) Notify(msg string, _ tui.Level)      { f.reports = append(f.reports, msg) }
+func (f *fakeRecoveryUI) NotifyLocal(msg string, _ tui.Level) { f.locals = append(f.locals, msg) }
+
+// TestStalePrompt walks an aged-out line through every submitting surface: a
+// typed prompt returns to the editor, remote text resolves its pending row and
+// only notices (foreign prompts never land in the host draft), and a serve run
+// drops with a notice.
+func TestStalePrompt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		line pumpLine
+		ui   fakeRecoveryUI
+		want fakeRecoveryUI // every seam the recovery touches, recorded wholesale
+	}{
+		{
+			name: "local typed editor prefill",
+			line: pumpLine{kind: command.KindPrompt, rest: "typed question"},
+			want: fakeRecoveryUI{
+				prepended: []string{"typed question"},
+				locals:    []string{"prompt returned; the session rewound while it waited"},
+			},
+		},
+		{
+			name: "remote origin resolves row only",
+			line: pumpLine{kind: command.KindPrompt, rest: "controller question",
+				queueID: "row-1", origin: submitOriginController},
+			want: fakeRecoveryUI{
+				drops: []ctl.QueueDroppedData{{Cause: rewindCauseRewind,
+					Rows: []ctl.QueueRow{{ID: "row-1", Text: "controller question"}}}},
+				locals: []string{"controller prompt dropped; the session rewound while it waited"},
+			},
+		},
+		{
+			name: "remote without pending id",
+			line: pumpLine{kind: command.KindPrompt, rest: "uncorrelated question", origin: submitOriginController},
+			want: fakeRecoveryUI{
+				locals: []string{"controller prompt dropped; the session rewound while it waited"},
+			},
+		},
+		{
+			name: "serve drops with notice",
+			ui:   fakeRecoveryUI{headless: true},
+			line: pumpLine{kind: command.KindPrompt, rest: "queued question",
+				queueID: "row-2", origin: submitOriginController},
+			want: fakeRecoveryUI{
+				headless: true,
+				drops: []ctl.QueueDroppedData{{Cause: rewindCauseRewind,
+					Rows: []ctl.QueueRow{{ID: "row-2", Text: "queued question"}}}},
+				reports: []string{"queued prompt dropped; the session rewound while it waited"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ui := tc.ui
+			stalePrompt(&ui, tc.line)
+			assert.Equal(t, tc.want, ui)
+		})
+	}
+}
+
 func TestRunCommandRecoversPanickingHandler(t *testing.T) {
 	t.Parallel()
 
