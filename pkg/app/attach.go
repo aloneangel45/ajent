@@ -54,8 +54,9 @@ const (
 // then the live event stream, with every input riding the control methods an
 // out-of-process controller has. It opens no transcript and runs no agent loop;
 // the remote run owns model, tools and permission mode. The exit code follows
-// the same table as a local run. A dropped socket reconnects rather than
-// exiting bare, rediscovery and banners included.
+// the same table as a local run: OK for a clean end or a detach, the
+// failed-turn code for an end with a reason and for a lost session. A dropped
+// socket reconnects rather than exiting bare, rediscovery and banners included.
 func RunAttach(o AttachOptions) int {
 	matches, live, err := client.Resolve(o.Socket)
 	if err != nil {
@@ -133,14 +134,7 @@ func RunAttach(o AttachOptions) int {
 
 		switch outcome {
 		case attachEnded:
-			// a clean end is definitive: the transcript stays, so the hint is
-			// resume, never attach
-			ui.Notify("the attached session ended", tui.LevelInfo)
-			if exitReason != "" {
-				ui.Notify(exitReason, tui.LevelWarn)
-			}
-			ui.Notify("resume it later with: ajent --resume "+resumeLabel(hello), tui.LevelInfo)
-			return ExitOK
+			return attachEnd(ui, exitReason, hello)
 		case attachDetached:
 			return ExitOK
 		case attachDropped:
@@ -183,6 +177,22 @@ func resumeLabel(h ctl.Hello) string {
 		return h.Session.Name
 	}
 	return h.Session.ID
+}
+
+// attachEnd paints the end of a run the remote session exited and returns the
+// process exit code: OK clean, a reason a failed turn. Only the clean end
+// carries the resume hint.
+func attachEnd(ui *tui.UI, reason string, hello ctl.Hello) int {
+	ui.Notify("the attached session ended", tui.LevelInfo)
+	if reason == "" {
+		// a clean end is definitive: the transcript stays, so the hint is
+		// resume, never attach
+		ui.Notify("resume it later with: ajent --resume "+resumeLabel(hello), tui.LevelInfo)
+		return ExitOK
+	}
+	// the reason is the notice, then the failed-turn code
+	ui.Notify(reason, tui.LevelWarn)
+	return ExitTurn
 }
 
 // attachOnce runs one attach session to an outcome: backfill, seat claim, the

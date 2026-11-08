@@ -673,6 +673,38 @@ func TestAttachOnceSeatClaim(t *testing.T) {
 	})
 }
 
+// TestAttachEndExitCodes asserts the end table over a session.exit reason.
+func TestAttachEndExitCodes(t *testing.T) {
+	t.Parallel()
+
+	hello := ctl.Hello{Session: ctl.Session{ID: "01TEST", Name: "named"}}
+	tests := []struct {
+		name   string
+		reason string
+		want   int
+	}{
+		{name: "clean_end_ok", want: ExitOK},
+		{name: "reason_is_failed_turn", reason: "turn failed: model error", want: ExitTurn},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ui, out := pipeUI(t)
+			assert.Equal(t, tc.want, attachEnd(ui, tc.reason, hello))
+			if tc.reason == "" {
+				require.Eventually(t, func() bool {
+					return strings.Contains(out(), "resume it later with: ajent --resume named")
+				}, ctlWait, 5*time.Millisecond)
+				return
+			}
+			// the reason is the notice; the resume hint stays clean-end only
+			require.Eventually(t, func() bool {
+				s := out()
+				return strings.Contains(s, tc.reason) && !strings.Contains(s, "resume it later")
+			}, ctlWait, 5*time.Millisecond)
+		})
+	}
+}
+
 // captureStderr runs fn with os.Stderr swapped for a pipe, returning what it wrote.
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
