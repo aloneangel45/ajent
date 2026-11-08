@@ -305,7 +305,7 @@ func TestAttachReconnect(t *testing.T) {
 
 		var ready, returned atomic.Bool
 		go func() {
-			r, _ := a.view.reconnectLoop(term, a.conn.Hello(), root, quit)
+			r, _ := a.view.reconnectLoop(term, a.conn.Hello(), root, &reconnectPace{}, quit)
 			ready.Store(r)
 			returned.Store(true)
 		}()
@@ -337,7 +337,7 @@ func TestAttachReconnect(t *testing.T) {
 
 		var gaveUp atomic.Bool
 		go func() {
-			_, gave := a.view.reconnectLoop(term, a.conn.Hello(), root, quit)
+			_, gave := a.view.reconnectLoop(term, a.conn.Hello(), root, &reconnectPace{}, quit)
 			gaveUp.Store(gave)
 		}()
 		require.Eventually(t, gaveUp.Load, ctlWait, 5*time.Millisecond)
@@ -399,15 +399,17 @@ func launchReconnect(t *testing.T, hello ctl.Hello) chan reconnectOutcome {
 	t.Helper()
 	term, _ := pipeUI(t)
 	root, stopRoot := context.WithCancel(t.Context())
-	t.Cleanup(stopRoot)
 	view := newAttachView(term, nil, root)
 	quit := make(chan struct{})
-	t.Cleanup(func() { close(quit) })
 	res := make(chan reconnectOutcome, 1)
+	done := make(chan struct{})
 	go func() {
-		ready, gaveUp := view.reconnectLoop(term, hello, root, quit)
+		defer close(done)
+		ready, gaveUp := view.reconnectLoop(term, hello, root, &reconnectPace{}, quit)
 		res <- reconnectOutcome{ready, gaveUp}
 	}()
+	// the loop exits here, before later cleanups restore the shared test seams
+	t.Cleanup(func() { stopRoot(); close(quit); <-done })
 	return res
 }
 
@@ -566,6 +568,90 @@ func TestReconnectLoopSkipsDeadRecords(t *testing.T) {
 	assert.Zero(t, accepts.Load())
 }
 
+func TestReconnectLoopPacingSpansCycles(t *testing.T) {
+	rig := newControlRig(t, nil)
+	sid := rig.hub.Snapshot().SessionID
+	rig.srv.Close("test") // the registry went with it
+
+	// a listener that accepts and closes immediately: every dial lands on a
+	// host-shaped socket and fails its hello fast, like a crash-looping serve
+	home, err := paths.Home()
+	require.NoError(t, err)
+	sock := filepath.Join(home, paths.ControlDirName, sid, "flapflap.sock")
+	writeInstanceRecord(t, sid, liveRecord(sid, "tokFLAPFLAPFLAPFLAP", sock))
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "unix", sock)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	var mu sync.Mutex
+	var dials []time.Time
+	go func() {
+		for {
+			nc, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			mu.Lock()
+			dials = append(dials, time.Now())
+			mu.Unlock()
+			_ = nc.Close()
+		}
+	}()
+
+	shrinkBackoff(t, 60*time.Millisecond)
+	term, _ := pipeUI(t)
+	root1, stopRoot1 := context.WithCancel(t.Context())
+	t.Cleanup(stopRoot1)
+	view := newAttachView(term, nil, root1)
+	hello := ctl.Hello{Session: ctl.Session{ID: sid}, Token: "origtoken"}
+	st := &reconnectPace{}
+	quit := make(chan struct{})
+	t.Cleanup(func() { close(quit) })
+
+	first := make(chan reconnectOutcome, 1)
+	go func() {
+		r, g := view.reconnectLoop(term, hello, root1, st, quit)
+		first <- reconnectOutcome{r, g}
+	}()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(dials) >= 2
+	}, ctlWait, 5*time.Millisecond)
+	stopRoot1()
+	out := awaitReconnect(t, first)
+	assert.False(t, out.ready)
+
+	grown := st.backoff // the channel receive orders it against the loop's writes
+	require.Greater(t, grown, reconnectFirst)
+
+	// a second cycle over the same state: its first dial waits out the carried
+	// backoff instead of starting over at full speed
+	root2, stopRoot2 := context.WithCancel(t.Context())
+	t.Cleanup(stopRoot2)
+	mu.Lock()
+	base := len(dials)
+	mu.Unlock()
+	before := time.Now()
+	second := make(chan reconnectOutcome, 1)
+	go func() {
+		r, g := view.reconnectLoop(term, hello, root2, st, quit)
+		second <- reconnectOutcome{r, g}
+	}()
+	var waited time.Duration
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(dials) <= base {
+			return false
+		}
+		waited = dials[base].Sub(before)
+		return true
+	}, ctlWait, 5*time.Millisecond)
+	assert.GreaterOrEqual(t, waited, grown/2)
+	stopRoot2() // the loop exits before cleanups restore the shared seams
+	awaitReconnect(t, second)
+}
+
 // attachOnceRig pairs a control rig holding its seat with one freshly dialed
 // attach connection, the way RunAttach wires attachOnce: no reader started,
 // hello recorded on the view.
@@ -686,11 +772,9 @@ func TestAttachOnceSeatClaim(t *testing.T) {
 	})
 }
 
-// TestAttachSeatRegainNotice walks the seat transitions an attach terminal can
-// hit: notices must cover every change it can see, and the one silent corner —
-// a reconnect handing a refused or taken seat back — names it (control-10).
 func TestAttachSeatRegainNotice(t *testing.T) {
 	// not parallel: the rig pins AJENT_HOME
+	// every seat transition the terminal can see names itself, a regained seat included
 
 	t.Run("holder_eof_keeps_viewer_silent", func(t *testing.T) {
 		rig := newControlRig(t, nil)
@@ -791,7 +875,6 @@ func TestAttachSeatRegainNotice(t *testing.T) {
 	})
 }
 
-// TestAttachEndExitCodes asserts the end table over a session.exit reason.
 func TestAttachEndExitCodes(t *testing.T) {
 	t.Parallel()
 

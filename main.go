@@ -97,6 +97,7 @@ func main() {
 		Serve:       f.serve,
 		Attach:      f.attach,
 		AttachGiven: f.attachGiven,
+		Force:       f.force,
 
 		SessMode:     sessMode,
 		SessTarget:   sessTarget,

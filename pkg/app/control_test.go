@@ -588,10 +588,9 @@ func floodStage(hub *sessionHub) {
 	}
 }
 
-// TestControlCloseJoinsWriters pins the exit guarantee's mechanism: Close can
-// only return once every writer drained its stage into the socket.
 func TestControlCloseJoinsWriters(t *testing.T) {
 	// not parallel: the rig pins AJENT_HOME
+	// Close returns only once every writer drained its stage into the socket
 	rig := newServeRig(t, nil)
 	c := dialControl(t, rig.path)
 	c.hello()
@@ -608,11 +607,9 @@ func TestControlCloseJoinsWriters(t *testing.T) {
 	}
 }
 
-// TestControlCloseBoundedStalledPeer pins the fail-open half: a peer that
-// never reads holds megabytes in the writer's blocked flush, and shutdown
-// still returns on its bound with the writer mid-drain.
 func TestControlCloseBoundedStalledPeer(t *testing.T) {
 	// not parallel: the rig pins AJENT_HOME
+	// a never-reading peer leaves its writer mid-drain; the bound still holds
 	rig := newServeRig(t, nil)
 	raw, err := (&net.Dialer{}).DialContext(t.Context(), "unix", rig.path)
 	require.NoError(t, err)
@@ -635,11 +632,9 @@ func TestControlCloseBoundedStalledPeer(t *testing.T) {
 	assert.Fail(t, "stalled peer's writer finished before the bound")
 }
 
-// TestControlCloseDeliversExitBeforeEOF pins what an attached terminal sees at
-// shutdown: the full backlog, session.exit last of all, then EOF. The peer
-// reads nothing until Close has run, the slow-but-reading shape.
 func TestControlCloseDeliversExitBeforeEOF(t *testing.T) {
 	// not parallel: the rig pins AJENT_HOME
+	// the slow-but-reading shape: full backlog, session.exit last of all, then EOF
 	rig := newServeRig(t, nil)
 	raw, err := (&net.Dialer{}).DialContext(t.Context(), "unix", rig.path)
 	require.NoError(t, err)

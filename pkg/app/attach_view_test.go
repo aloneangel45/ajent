@@ -342,10 +342,9 @@ func TestAttachViewWatermarkDropsStaleEvents(t *testing.T) {
 	assert.NotContains(t, out(), "stale echo")
 }
 
-// TestAttachFollowInstance covers the pre-live buffer across a reconnect: a
-// different serving instance restarts its seqs at 1, so the previous
-// instance's buffered events must drop rather than pass the new watermark.
 func TestAttachFollowInstance(t *testing.T) {
+	// a different serving instance restarts its seqs at 1, so buffered events
+	// from the previous one must never pass the new watermark
 	t.Run("restarted_instance_drops_buffer", func(t *testing.T) {
 		rig := newControlRig(t, nil)
 		a := newAttachRig(t, rig)
@@ -389,6 +388,27 @@ func TestAttachFollowInstance(t *testing.T) {
 		a.view.send(func() { require.NoError(t, a.view.applyBackfill(snap, nil, 5)) })
 		require.Eventually(t, func() bool { return strings.Contains(a.out(), "bridged tail") },
 			ctlWait, 5*time.Millisecond)
+	})
+
+	// a different instance's broker ids restart too, so tracked dialogs must not
+	// survive to collide with or stand in for the new hub's own
+	t.Run("restarted_instance_settles_dialogs", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		a := newAttachRig(t, rig)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+		a.view.send(func() {
+			a.view.dialogs[3] = &openDialog{data: ctl.InteractionPendingData{ID: 3}, cancel: cancel}
+		})
+		a.view.waitIdle()
+
+		restarted := a.conn.Hello()
+		restarted.Token = "restarted-instance-token"
+		a.view.followInstance(restarted)
+
+		a.view.call(func() { _, tracked := a.view.dialogs[3]; assert.False(t, tracked) })
+		assert.ErrorIs(t, ctx.Err(), context.Canceled)
 	})
 }
 
@@ -744,7 +764,9 @@ func TestAttachSeatDowngradeClosesRacers(t *testing.T) {
 	var watching bool
 	a.view.call(func() { watching = a.view.dialogs[4].cancel == nil })
 	assert.True(t, watching)
-	assert.Contains(t, a.out(), "confirmation waiting on the control seat: proceed?")
+	require.Eventually(t, func() bool {
+		return strings.Contains(a.out(), "confirmation waiting on the control seat: proceed?")
+	}, ctlWait, 5*time.Millisecond)
 
 	// the forced-takedown path lands the same downgrade plus its banner
 	a.view.setSeat(true)
@@ -752,6 +774,65 @@ func TestAttachSeatDowngradeClosesRacers(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return strings.Contains(a.out(), `control seat taken by "other attach (pid 7)"; watching read-only`)
 	}, ctlWait, 5*time.Millisecond)
+}
+
+func TestYieldDialog(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
+	rig := newControlRig(t, nil)
+	a := newAttachRig(t, rig)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	a.view.send(func() {
+		a.view.dialogs[5] = &openDialog{data: ctl.InteractionPendingData{ID: 5}, cancel: cancel}
+	})
+	a.view.waitIdle()
+
+	a.view.yieldDialog(5)
+	var yielded bool
+	a.view.call(func() {
+		_, tracked := a.view.dialogs[5]
+		yielded = tracked && a.view.dialogs[5].cancel == nil
+	})
+	assert.True(t, yielded)
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+
+	// a settled dialog stays gone: the yield never resurrects an entry
+	a.view.settleInteraction(5)
+	a.view.yieldDialog(5)
+	a.view.call(func() { _, tracked := a.view.dialogs[5]; assert.False(t, tracked) })
+	a.view.waitIdle()
+}
+
+func TestRaceDialog(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
+	rig := newControlRig(t, nil)
+	term, feed, out := pipeInputUI(t)
+	a := newAttachRigTerm(t, rig, term, out, false)
+	a.view.setSeat(true)
+
+	d := ctl.InteractionPendingData{ID: 6, Kind: "input", Prompt: "name"}
+	a.view.send(func() { a.view.beginInteraction(a.view.root, d) })
+	a.view.waitIdle()
+
+	a.view.connDown() // the socket drops while the dialog is open
+	feed("typed answer\n")
+	require.Eventually(t, func() bool {
+		var yielded bool
+		a.view.call(func() {
+			_, tracked := a.view.dialogs[6]
+			yielded = tracked && a.view.dialogs[6].cancel == nil
+		})
+		return yielded
+	}, ctlWait, 5*time.Millisecond)
+
+	// the reconnect's resnapshot still lists the dialog: it races again
+	a.view.send(func() {
+		a.view.reconcileDialogs(a.view.root, []ctl.InteractionPendingData{d})
+		assert.NotNil(t, a.view.dialogs[6].cancel)
+		a.view.settleInteraction(6) // retire the fresh racer
+	})
+	a.view.waitIdle()
 }
 
 func TestAttachSeatGainRacesOpenDialog(t *testing.T) {

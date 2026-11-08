@@ -424,10 +424,6 @@ func (f *fakeRecoveryUI) PrependInput(text string)            { f.prepended = ap
 func (f *fakeRecoveryUI) Notify(msg string, _ tui.Level)      { f.reports = append(f.reports, msg) }
 func (f *fakeRecoveryUI) NotifyLocal(msg string, _ tui.Level) { f.locals = append(f.locals, msg) }
 
-// TestStalePrompt walks an aged-out line through every submitting surface: a
-// typed prompt returns to the editor, remote text resolves its pending row and
-// only notices (foreign prompts never land in the host draft), and a serve run
-// drops with a notice.
 func TestStalePrompt(t *testing.T) {
 	t.Parallel()
 
@@ -438,7 +434,7 @@ func TestStalePrompt(t *testing.T) {
 		want fakeRecoveryUI // every seam the recovery touches, recorded wholesale
 	}{
 		{
-			name: "local typed editor prefill",
+			name: "typed_line_returns_to_editor",
 			line: pumpLine{kind: command.KindPrompt, rest: "typed question"},
 			want: fakeRecoveryUI{
 				prepended: []string{"typed question"},
@@ -446,7 +442,7 @@ func TestStalePrompt(t *testing.T) {
 			},
 		},
 		{
-			name: "remote origin resolves row only",
+			name: "remote_origin_row_only",
 			line: pumpLine{kind: command.KindPrompt, rest: "controller question",
 				queueID: "row-1", origin: submitOriginController},
 			want: fakeRecoveryUI{
@@ -456,14 +452,14 @@ func TestStalePrompt(t *testing.T) {
 			},
 		},
 		{
-			name: "remote without pending id",
+			name: "remote_without_pending_id",
 			line: pumpLine{kind: command.KindPrompt, rest: "uncorrelated question", origin: submitOriginController},
 			want: fakeRecoveryUI{
 				locals: []string{"controller prompt dropped; the session rewound while it waited"},
 			},
 		},
 		{
-			name: "serve drops with notice",
+			name: "serve_drops_with_notice",
 			ui:   fakeRecoveryUI{headless: true},
 			line: pumpLine{kind: command.KindPrompt, rest: "queued question",
 				queueID: "row-2", origin: submitOriginController},

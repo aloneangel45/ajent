@@ -40,6 +40,18 @@ var reconnectFirst = 250 * time.Millisecond
 // end. A var so tests can shrink it.
 var reconnectGiveUp = 5 * time.Minute
 
+// attachStableAfter splits a stable attach's fresh retry stretch from a young
+// drop extending the running one. A var so tests can shrink it.
+var attachStableAfter = 30 * time.Second
+
+// reconnectPace is retry pacing shared across a run's attach cycles, so fast
+// drops accumulate toward the give-up instead of restarting per cycle.
+type reconnectPace struct {
+	started time.Time     // when this offline stretch began; zero until set
+	backoff time.Duration // the next attempt's wait before dialing
+	hinted  bool          // the still-offline hint has fired this stretch
+}
+
 // attachOutcome is one attach session's end, deciding what the outer loop does.
 type attachOutcome int
 
@@ -116,8 +128,9 @@ func RunAttach(o AttachOptions) int {
 	go pumpSubmissions(view, submissions)
 
 	// run attaches once, then reconnects follow the state machine until the
-	// session ends or this terminal detaches
+	// session ends or this terminal detaches. One pace spans all its cycles.
 	var backfillFails int
+	var pace reconnectPace
 	for {
 		if conn == nil {
 			conn, hello, err = client.Dial(picked[0].Socket)
@@ -129,6 +142,7 @@ func RunAttach(o AttachOptions) int {
 			view.setHello(hello)
 		}
 
+		attachedAt := time.Now()
 		outcome, exitReason := attachOnce(view, conn, hello, holderName, o.Force, submissions, quit)
 		conn.Close()
 
@@ -158,8 +172,12 @@ func RunAttach(o AttachOptions) int {
 
 		// reconnect state machine: keep scrollback and the local draft (drafts
 		// are local state by design), retry with backoff, re-discover by
-		// session id, then resnapshot and render only the difference
-		ready, gaveUp := view.reconnectLoop(ui, hello, root, quit)
+		// session id, then resnapshot and render only the difference. Drops
+		// past attachStableAfter open a fresh stretch, younger ones extend it.
+		if time.Since(attachedAt) >= attachStableAfter {
+			pace = reconnectPace{}
+		}
+		ready, gaveUp := view.reconnectLoop(ui, hello, root, &pace, quit)
 		if gaveUp {
 			ui.Notify("gave up reconnecting; attach again with: ajent --attach "+resumeLabel(hello), tui.LevelWarn)
 			return ExitTurn
@@ -333,84 +351,92 @@ func pumpSubmissions(view *attachView, submissions <-chan string) {
 	}
 }
 
-// reconnectLoop keeps trying until one instance of the session serves again.
-// It prefers the same instance; one other live instance is followed with a
-// naming banner; several open the picker, never a silent swap. Lines typed
-// while offline are refused with their text kept, never held by the retry. It
-// reports whether a connection is ready, false when the user detached, and
-// true in gaveUp when the offline stretch outlasts reconnectGiveUp: a lost
-// session exits with a distinct code instead of retrying forever.
-func (v *attachView) reconnectLoop(ui *tui.UI, hello ctl.Hello, root context.Context, quit <-chan struct{}) (ready, gaveUp bool) {
+// reconnectLoop keeps trying until an instance of the session serves again,
+// preferring the one it was on, following a sole survivor with a banner and
+// opening the picker among several. Lines typed while offline are refused
+// with their text kept for the editor. st carries pacing across attach
+// cycles, so fast drops share one backoff and give-up window. It reports
+// ready once connected, false when the user detached, and gaveUp once this
+// stretch outlasts reconnectGiveUp, which callers exit as a failed turn.
+func (v *attachView) reconnectLoop(ui *tui.UI, hello ctl.Hello, root context.Context,
+	st *reconnectPace, quit <-chan struct{}) (ready, gaveUp bool) {
 	ui.Notify("connection lost; reconnecting", tui.LevelWarn)
+	if st.started.IsZero() {
+		st.started = time.Now()
+	}
+	if st.backoff <= 0 {
+		st.backoff = reconnectFirst
+	}
 
-	backoff := reconnectFirst
-	started := time.Now()
-	var hinted bool
 	for {
-		if !hinted && time.Since(started) >= reconnectHintWait {
-			// the hint a drop eventually owes: attaching again, never a resume,
-			// the session may be gone for good
+		if !st.hinted && time.Since(st.started) >= reconnectHintWait {
+			// the owed offline hint: attach again later, never resume
 			ui.Notify("still offline; the session may have exited, attach again later with: ajent --attach "+
 				resumeLabel(hello), tui.LevelWarn)
-			hinted = true
+			st.hinted = true
 		}
-		if time.Since(started) >= reconnectGiveUp {
+		if time.Since(st.started) >= reconnectGiveUp {
 			return false, true
 		}
-		// live records only: record-only liveness already judged the dead ones,
-		// whose sockets would waste the dial below
-		live, err := client.DiscoverLive()
-		if err == nil {
-			follow := client.Followable(live, hello.Session.ID, hello.Token)
-			if len(follow) == 0 {
-				// Followable answers nil for several candidates of the session
-				// as for none; refilter so the picker sees the several
-				follow = bulk.SliceFilter(func(in client.Instance) bool {
-					return in.SessionID == hello.Session.ID
-				}, live)
-			}
-			switch len(follow) {
-			case 1:
-				next := follow[0]
-				if next.Token != hello.Token && !next.Started().IsZero() {
-					ui.Notify(fmt.Sprintf("following new instance of %s (pid %d, started %s)",
-						next.Label(), next.PID, next.Started().Local().Format("15:04:05")), tui.LevelInfo)
-				}
-				conn, nh, derr := client.Dial(next.Socket)
-				if derr == nil {
-					// the resnapshot rides attachOnce's backfill, which renders
-					// only the difference against the rendered set
-					v.swapConn(conn)
-					v.followInstance(nh)
-					return true, false
-				}
-			case 0:
-				// none serving yet; fall through to the wait
-			default:
-				picked, perr := pickInstancesFn(root, ui, follow, false)
-				if perr != nil {
-					if errors.Is(perr, tui.ErrCancelled) {
-						return false, false
-					}
-					break // picker failed; the wait below spaces the retry
-				}
-				hello.Token = picked[0].Token // the user chose: follow it like a first attach
-				continue                      // dial through the same path next round
-			}
-		}
+
+		// every attempt waits first: typed lines refuse and re-wait, never
+		// trigger an immediate dial
 		select {
 		case line, ok := <-ui.Messages():
 			if !ok {
 				return false, false // stdin EOF detaches, like a ctrl+c quit
 			}
 			v.notConnected(line)
+			continue
 		case <-quit:
 			return false, false // the double-ctrl+c detach works mid-reconnect too
 		case <-root.Done():
 			return false, false
-		case <-time.After(backoff):
+		case <-time.After(st.backoff):
 		}
-		backoff = min(backoff*2, reconnectMax)
+		st.backoff = min(st.backoff*2, reconnectMax)
+
+		// live records only: record-only liveness already judged the dead ones,
+		// whose sockets would waste the dial below
+		live, err := client.DiscoverLive()
+		if err != nil {
+			continue // discovery failed, wait out the next round
+		}
+		follow := client.Followable(live, hello.Session.ID, hello.Token)
+		if len(follow) == 0 {
+			// Followable answers nil for several candidates of the session
+			// as for none; refilter so the picker sees the several
+			follow = bulk.SliceFilter(func(in client.Instance) bool {
+				return in.SessionID == hello.Session.ID
+			}, live)
+		}
+		switch len(follow) {
+		case 1:
+			next := follow[0]
+			if next.Token != hello.Token && !next.Started().IsZero() {
+				ui.Notify(fmt.Sprintf("following new instance of %s (pid %d, started %s)",
+					next.Label(), next.PID, next.Started().Local().Format("15:04:05")), tui.LevelInfo)
+			}
+			conn, nh, derr := client.Dial(next.Socket)
+			if derr == nil {
+				// the resnapshot rides attachOnce's backfill, which renders
+				// only the difference against the rendered set
+				v.swapConn(conn)
+				v.followInstance(nh)
+				return true, false
+			}
+		case 0:
+			// none serving yet
+		default:
+			picked, perr := pickInstancesFn(root, ui, follow, false)
+			if perr != nil {
+				if errors.Is(perr, tui.ErrCancelled) {
+					return false, false
+				}
+				break // picker failed, retry next round
+			}
+			hello.Token = picked[0].Token // the user chose: follow it like a first attach
+		}
 	}
 }
 

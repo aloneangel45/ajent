@@ -85,10 +85,11 @@ func (v *attachView) setHello(h ctl.Hello) {
 }
 
 // followInstance adopts a reconnect's greeting. A different serving instance
-// drops the pre-live buffer: that hub restarted its seqs at 1, so the previous
-// instance's buffered events would pass the new watermark and paint stale
-// deltas. The same instance keeps it, one seq space bridging events between
-// connect and snapshot.
+// drops the pre-live buffer and settles every tracked dialog: that hub
+// restarted its seqs and dialog ids at 1, so the previous instance's buffered
+// events would pass the new watermark and paint stale deltas, and its dialog
+// entries could collide with fresh ids. The same instance keeps both, one seq
+// space bridging events between connect and snapshot.
 func (v *attachView) followInstance(h ctl.Hello) {
 	v.call(func() {
 		v.mu.Lock()
@@ -97,6 +98,9 @@ func (v *attachView) followInstance(h ctl.Hello) {
 		v.mu.Unlock()
 		if changed {
 			v.buf = nil
+			for _, id := range bulk.MapKeysSlice(v.dialogs) {
+				v.settleInteraction(id)
+			}
 		}
 	})
 }
@@ -689,7 +693,10 @@ func (v *attachView) raceDialog(ctx context.Context, d ctl.InteractionPendingDat
 	defer rcancel()
 	conn := v.connFor()
 	if conn == nil {
-		return // the socket dropped mid-dialog; the reconnect's resnapshot re-races it
+		// the socket dropped mid-dialog; the yield lets the reconnect's
+		// resnapshot re-race the dialog it still lists
+		v.yieldDialog(d.ID)
+		return
 	}
 	err := conn.Resolve(rctx, ans)
 	var wire *ctl.Error
@@ -700,6 +707,8 @@ func (v *attachView) raceDialog(ctx context.Context, d ctl.InteractionPendingDat
 		return // the other side won the race; its settled event already dismissed this dialog
 	default:
 		v.ui.Notify("answering failed: "+err.Error(), tui.LevelWarn)
+		// the dialog may still hold: yield so a resnapshot can re-race it
+		v.yieldDialog(d.ID)
 	}
 }
 
@@ -729,6 +738,18 @@ func (v *attachView) settleInteraction(id uint64) {
 	if d != nil && d.cancel != nil {
 		d.cancel()
 	}
+}
+
+// yieldDialog demotes one racer's entry back to un-raced, cancelling the
+// racer's context so a resnapshot still listing the dialog re-opens it under
+// the seat's role. No-op once the dialog settled or re-raced.
+func (v *attachView) yieldDialog(id uint64) {
+	v.send(func() {
+		if d, ok := v.dialogs[id]; ok && d.cancel != nil {
+			d.cancel()
+			d.cancel = nil
+		}
+	})
 }
 
 // setSeat records whether this connection holds the control seat after a

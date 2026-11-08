@@ -39,7 +39,7 @@ last in the filter so no configuration can reach past it.
 
 ## The package
 
-### `manager.go` — lifecycle
+### Manager lifecycle (`manager.go`)
 
 The manager is configured by func fields supplied by `pkg/app`, mirroring
 `permit.Barrier`: how to build a provider and resolve the child model/reasoning,
@@ -92,7 +92,7 @@ final word on the UI. An interrupted turn is cheaper:
 so cancelling the tool call releases the poll immediately while the job itself
 keeps running.
 
-### `job.go` — one investigation
+### One job (`job.go`)
 
 A job carries a status from a small enum: queued, running, done, error, aborted.
 The public snapshot callers read pairs that with an id (`sub-N`), a shortened
@@ -121,11 +121,11 @@ payloads), and a poller count. A finished job's snapshot keeps its terminal
 state, and jobs are never deleted from the map within a session (they show up in
 `/agents` until shutdown).
 
-### `run.go` — child construction and the summary contract
+### Child construction and the summary contract (`run.go`)
 
 Each job builds a fresh agent:
 
-- **State** — `agent.State{Model, Reasoning, Tokens}`. Model is `subagent.model`
+- **State:** `agent.State{Model, Reasoning, Tokens}`. Model is `subagent.model`
   resolved through the registry when set (at spawn, so `/settings` applies to the
   next job), else inherited from the session, and reasoning is likewise inherited
   verbatim, because a user who dialled it down meant it. Tokens is a fresh child
@@ -161,7 +161,7 @@ summarise.
 mistaken for a completed investigation, and never a completion notification. A
 job the user stopped is not reported as done.
 
-### `toolset.go` — the structural filter
+### The structural filter (`toolset.go`)
 
 The parent tool registry arrives as a narrow source with two operations: return
 every declared tool **unwrapped** (a child runs no parent guards or dialogs),
@@ -183,7 +183,7 @@ A child's tool set is a fixed, structural subset of `Registry.All()`:
 This filter, not the permission barrier or a prompt instruction, is what makes a
 child read-only: there is no user at its end to approve anything else.
 
-### `sink.go` — one activity row per job
+### One activity row per job (`sink.go`)
 
 `childSink` embeds `agent.NopSink` and overrides only the events that feed a
 row, publishing through `Options.Activity(key, text)`. Nothing it emits reaches
@@ -218,7 +218,7 @@ surfaces live where it lands and is replay-marked for resume and rewind, but
 never becomes recallable prompt history. Only messages the user actually typed
 do. See `agent-loop-design.md` for both flags.
 
-### `tools.go` — the three tools
+### The three tools (`tools.go`)
 
 All three are `agent.ModeParallel`. Their `Label(call)` methods read the call's
 arguments so the committed tool header names the target. `agent_start` shows its
@@ -300,12 +300,12 @@ is wasted. Delivery is **batched and decided late**. Completions only
 accumulate, and the message naming them is built at the moment it lands, never
 before. Three pieces:
 
-- **UI notice** — fired at completion (`Options.Notice`), keyed by the front end
+- **UI notice.** Fired at completion (`Options.Notice`), keyed by the front end
   (`NotifyKeyed`) so consecutive notices collapse in place rather than stack into
   one row per job, and each renders as one updating line, not a new committed row.
   Its publish is serialized with the status segment, so two near-simultaneous
   completions cannot land an older, smaller batch after the full one.
-- **Context steer at a step boundary** — completed ids accumulate, and the
+- **Context steer at a step boundary.** Completed ids accumulate, and the
   host chains `Manager.Boundary()` into `agent.Options.OnBoundary`, so at the
   boundary the manager filters them down to ids with no poller and no prior
   consumption, dropping duplicates: a batch that accumulated while the model streamed
@@ -344,9 +344,9 @@ age) and the done count, a short form for narrow rows, cleared when no jobs
 exist. The front end renders it as a keyed status segment.
 
 A structured `Tally` (running, queued, done) publishes immediately before each
-callback through the same serialization, so the host can attach machine-readable
-counts to the segment without parsing the prose. Controllers read those counts
-from the control socket's status segments rather than regexing the text.
+callback through the same serialization, an order the host relies on when it
+attaches counts to the segment. Controllers read those counts from the control
+socket's status segments instead of parsing prose.
 
 ## Accounting and configuration seams
 
@@ -355,8 +355,8 @@ from the control socket's status segments rather than regexing the text.
 A child's ledger is created via the parent's `Accounting.Child()`, and every job
 rolls its usage into the parent's own totals. Two invariants:
 
-- **`Total()` stays inclusive** — session spend counts children too.
-- **`Context()` never moves for a child** — the rollup touches only totals, never
+- **`Total()` stays inclusive:** session spend counts children too.
+- **`Context()` never moves for a child:** the rollup touches only totals, never
   context terms, so a fan-out of investigations does not corrupt the main
   context bar.
 The delegated subset is exposed as `Accounting.ChildTotal()`, which `/usage`

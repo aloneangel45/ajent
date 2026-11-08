@@ -85,7 +85,7 @@ keep that single path honest under concurrent controllers.
   wait it sits in and recovering its queued prompts, exactly as it stops a
   running turn. Pump lines carry the lane's dispatch generation, which a rewind
   bumps. Aged locally typed lines return to the editor with a notice naming what
-  happened; remote submits resolve their pending row instead, so foreign text
+  happened. Remote submits resolve their pending row instead, so foreign text
   never lands in the host draft. Either way a buffered prompt is decided once and
   never lands by accident.
 - **Rewind is one transaction.** Swapping agent state, moving the writer head and
@@ -177,17 +177,13 @@ one exception below.
 **Publishing costs what watching costs.** A publish with no listener encodes nothing and
 spends no number, so the numbers stay dense over what subscribers received rather than
 over mutations (seat release already spent none). The view-model update never skips, so
-a snapshot stays the freshest truth a reconnecting client reconciles toward. Encoding
-stays out of the critical section where ordering allows it: stream deltas encode before
-the hub lock, and one shared frame per event encodes its wire line once, for whichever
-connection writer drains it first, so fanout to many observers costs one encode plus one
-buffer write each.
+a snapshot stays the freshest truth a reconnecting client reconciles toward.
 
 **Open dialogs are state, not paint.** A dialog holding the run cannot be an event a late
 arrival misses, so every snapshot lists the interactions still open, exactly as their
 pending events announced them. A controller that attaches mid-dialog learns what holds
 input and can answer it by id. A reconnecting holder re-races locally what it still lists
-and cancels racers whose dialogs settled while it was away; a viewer never races, the
+and cancels racers whose dialogs settled while it was away. A viewer never races, the
 seat refusing its answers, so it reports what holds instead. Reconciliation stays the one
 watermark rule, by dialog id. Open dialogs ride the socket only: never the transcript
 (they are runtime state, not history) and never the discovery record (which stays static
@@ -212,7 +208,7 @@ longer lists (segments, activity rows and queue rows removed while the terminal 
 and a spinner whose turn ended without its end event surviving the drop), so stale chrome
 cannot outlive the resnapshot. The snapshot's open dialogs are part of that difference,
 so a dialog spanning a drop re-races for the seat holder instead of stranding the run on
-a dialog nobody attached can see; a viewer re-reports it as held, since the seat refuses
+a dialog nobody attached can see. A viewer re-reports it as held, since the seat refuses
 its answers.
 
 Delivery is fail-open and bounded. Each connection stages outbound lines behind its own
@@ -278,7 +274,7 @@ the attached terminal can do, a script can do too. Decisions worth keeping:
   keeps its list until the episode ends, so a recalled prompt never jumps under the
   user's thumbs.
 - **The seat degrades honestly.** Attach claims the seat, or attaches as a named read-only
-  viewer when another controller holds it, and every change it can see names itself: the
+  viewer when another controller holds it. Every change it can see names itself: the
   attach-time notice, refusals naming the holder (or nobody) on any write attempt, the
   forced-takeover announcement, and a reconnect that hands a refused or taken seat back,
   so no terminal flips into control against its last seat message. Only a holder opens
@@ -292,8 +288,11 @@ the attached terminal can do, a script can do too. Decisions worth keeping:
   filters the dead before any dial. It prefers the instance it was on, follows a sole
   surviving instance openly, and picks among several rather than silently switching onto a
   sibling's head. Following a different instance drops the terminal's pre-snapshot event
-  buffer, since the new hub restarts its seqs at 1; the same instance keeps it, bridging
-  events between connect and snapshot. Submits while reconnecting fail legibly with the
+  buffer and settles its tracked dialogs, since the new hub restarts its seqs and dialog
+  ids at 1. The same instance keeps both, bridging events between connect and snapshot.
+  A holder's racer that cannot send its answer (socket down mid-dialog, a failed resolve)
+  yields its entry the same way, so the resnapshot re-races the dialog it still lists.
+  Submits while reconnecting fail legibly with the
   editor text preserved. Past a give-up window the terminal exits as a failed turn, so a
   script can tell a lost session from a clean end, and only a clean end shows the
   `--resume <name>` hint.
@@ -355,7 +354,7 @@ prompts verbatim, so redaction covers the live surfaces only.
    holds that inventory.
 5. Committed content is entry appends plus branch changes, reconciled by entry id alone.
    Everything else is ephemeral, governed by the watermark and never reconciled against the
-   file, except open dialogs: they hold the run, so every snapshot lists them; the seat
+   file, except open dialogs: they hold the run, so every snapshot lists them. The seat
    holder re-races what it lists, a viewer only reports what holds.
 6. A live append paints exactly what replay paints for the same entry: one echo rule,
    defined beside replay, feeds committed history and live appends alike.

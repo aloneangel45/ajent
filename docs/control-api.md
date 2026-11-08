@@ -84,7 +84,7 @@ you are not offered, and payload fields rather than erroring on them.
 | `not-found` | unknown target (rewind head entry id, interaction id, model or settings key) |
 | `settled` | a dialog already resolved, first answer won |
 | `busy` | the prompt queue is full, retry once it drains |
-| `unexpected` | the verb faulted mid-run; its effect may have partially applied, so reconcile from `state.get` before writing again |
+| `unexpected` | the verb faulted mid-run. Its effect may have partially applied, so reconcile from `state.get` before writing again |
 
 A refusal is always a reply with `error`, never a transport failure. Errors carry a
 human-readable `message` on top of the code. Scripts should branch on `code` and `holder`.
@@ -182,10 +182,11 @@ Params and results with their wire keys:
 - **`state.get`** → one snapshot object, documented in [Snapshots](#snapshots). The reply's
   `seq` is the snapshot's own number.
 - **`agents.list`** lists every sub-agent job exactly as `/agents list` renders them:
-  `{jobs: [{id, task?, status, elapsedMs?}]}` in job-number order (`sub-1`, ..., `sub-10`),
-  finished ones included. `task` is the single-line label and `elapsedMs` the queue wait for
-  a job that never ran, else its runtime frozen once finished. A session with no sub-agent
-  wiring refuses `unavailable`. Read-only: it answers any connection.
+  `{jobs: [{id, task?, status, elapsedMs?}]}` in job-number order (numeric, so `sub-2`
+  precedes `sub-10`), finished ones included. `task` is the single-line label and
+  `elapsedMs` the queue wait for a job that never ran, else its runtime frozen once
+  finished. A session with no sub-agent wiring refuses `unavailable`. Read-only: it
+  answers any connection.
 - **`models.get`** lists the model registry exactly as the running process resolved it
   (config plus discovery, no compiled entries), so a controller renders a picker without
   riding one. `{active}` names the model now in effect and each entry of `models` is the
@@ -283,11 +284,12 @@ Params and results with their wire keys:
   config file layer (`user` or `project`) exactly as the `/settings` save prompt would.
   The reply carries the row after the change.
 - **`agents.stop`** stops one job by id or every in-flight job with `all`, through the same
-  seam `/agents stop` uses. Exactly one of `id` or `all` applies; both or neither is
+  seam `/agents stop` uses. Exactly one of `id` or `all` applies. Both or neither is
   `bad-request`. The reply's `{stopped}` counts jobs actually cancelled, for `all` only
-  the ones still in flight. A stopped job reports `aborted`, never done, and Esc never
-  cancels jobs. An unknown id is `not-found`; a finished one (done or errored) refuses
-  `unavailable`, since it cannot stop again.
+  the ones still in flight. A stopped job reports `aborted`, never done, and `interrupt`
+  leaves jobs running, so this is the only cancellation path. An unknown id is
+  `not-found`. A finished one (done or errored) refuses `unavailable`, since it cannot
+  stop again.
 
 ## Events
 
@@ -339,10 +341,10 @@ Rendering rules a controller needs:
 - **Keyed families replace, empty text removes.** A `status` segment and an `activity` row
   carry a key. Setting non-empty text adds or replaces that row, and empty text reports its
   removal. A segment may carry `counts`, machine-readable tallies beside its prose (the
-  subagents segment publishes `running`, `queued` and `done`) that replace whole with the
-  text. An unkeyed `notice` prints, while a keyed one (`key` set) replaces in place instead
-  of stacking. The same applies to `tool.*`, keyed by call id: a header commits once its result
-  or first output arrives.
+  subagents segment publishes `running`, `queued` and `done`). Counts ride the key, so
+  they replace together with the text. An unkeyed `notice` prints, while a keyed one
+  (`key` set) replaces in place instead of stacking. The same applies to `tool.*`, keyed
+  by call id: a header commits once its result or first output arrives.
 - **Tolerate events for state you never saw.** `tool.progress` reports arguments that are still
   streaming, so it can name a call before its `tool.start`, and an attach window can lose the
   start entirely: render the header from the `tool.result`. Turn boundaries are likewise
@@ -435,7 +437,7 @@ since additions are additive changes.
   `ask`, `decision`. The answer shape to trust comes from the flags, not the kind: `options`
   for `index`, `multi` for `indexes`, `text` for a text answer.
 - **Sub-agent statuses** (`agents.list`): `queued`, `running`, `done`,
-  `error`, `aborted`. A stop turns an in-flight job into `aborted`; it never reports done.
+  `error`, `aborted`. A stop turns an in-flight job into `aborted` and never reports done.
   Each job's activity row (keyed by its id) carries free prose and clears when the job
   ends, whatever the outcome.
 - **Status segment tally keys** (`counts`): `running`, `queued`, `done`, matching the
@@ -565,11 +567,11 @@ error (`*ctl.Error`) rather than a transport failure.
 | symbol | contract |
 |---|---|
 | `Discover() ([]Instance, error)` | every live instance's registry record, sorted by session id. A corrupt or truncated file reads as absent, and nothing here dials |
-| `DiscoverLive() ([]Instance, error)` | Discover without the dead records: every instance whose recorded pid still answers signal zero past its first minute. It never dials and never collects; removing a dead record stays the serving instances' passive sweep |
+| `DiscoverLive() ([]Instance, error)` | Discover without the dead records: every instance whose recorded pid still answers signal zero past its first minute. It never dials and never collects. Removing a dead record stays the serving instances' passive sweep |
 | `InstanceDead(in Instance) bool` | the record-only liveness test: a record at least one minute old whose recorded pid fails signal zero. Anything undecidable (no usable pid, a permission error, a reused pid) reads as alive, so a caller only drops a record on proof of death |
 | `Resolve(target string) (matches, live []Instance, err error)` | Discovery's target-resolution order over the registry. An empty target returns every instance in both slices, a socket-path target wins outright as one record with only `Socket` filled, and a miss is an error naming the target while the second slice carries the full live set for a picker |
 | `Followable(live []Instance, sessionID, token string) []Instance` | what a reconnecting controller follows: the same token when it still serves, else a sole surviving instance of that session, else nil so several candidates never become a silent swap onto a sibling's head |
-| `SavedSessions() ([]session.Listed, error)` | every saved session under the ajent home across all workspaces through ajent's own store (`session.Store.ListAll`), most recently used first. Each row carries the workspace its transcript recorded for resume targets to derive from; a newer-format transcript still lists marked `Blocked`, one without decodable identity never lists, and opening the store creates the sessions root when missing |
+| `SavedSessions() ([]session.Listed, error)` | every saved session under the ajent home across all workspaces through ajent's own store (`session.Store.ListAll`), most recently used first. Each row carries the workspace its transcript recorded for resume targets to derive from. A newer-format transcript still lists marked `Blocked`, one without decodable identity never lists, and opening the store creates the sessions root when missing |
 | `Instance` | alias of `ctl.Instance`, with `Label()` (name or id), `Started()` and `String()` for listing rows |
 
 ### Connection lifecycle
@@ -608,7 +610,7 @@ context and surfaces wire refusals unchanged.
 | `QueueRecall(ctx) (ctl.RecallResult, error)` | `queue.recall` | the popped row whole: its `ID` names the queue entry that left, so a controller tracking pending rows resolves them by id. Zero result when nothing was queued |
 | `Resolve(ctx, ctl.ResolveParams) error` | `interaction.resolve` | pass exactly one answer shape with the dialog `ID` |
 | `AgentsList(ctx) (ctl.AgentsListResult, error)` | `agents.list` | every job's id, task label, status and elapsed time, finished ones included |
-| `AgentsStop(ctx, ctl.AgentsStopParams) (ctl.AgentsStopResult, error)` | `agents.stop` | how many jobs were cancelled; pass exactly one of `ID` or `All` |
+| `AgentsStop(ctx, ctl.AgentsStopParams) (ctl.AgentsStopResult, error)` | `agents.stop` | how many jobs were cancelled. Pass exactly one of `ID` or `All` |
 | `ReadBranch(path, head string) ([]session.Entry, error)` | package-level | read one transcript file and return its chain under `head`, oldest first, tolerating a torn final line |
 
 Every method in the table above has a typed wrapper. `Call` remains the escape hatch for any
