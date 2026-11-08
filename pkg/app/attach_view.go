@@ -83,6 +83,23 @@ func (v *attachView) setHello(h ctl.Hello) {
 	v.mu.Unlock()
 }
 
+// followInstance adopts a reconnect's greeting. A different serving instance
+// drops the pre-live buffer: that hub restarted its seqs at 1, so the previous
+// instance's buffered events would pass the new watermark and paint stale
+// deltas. The same instance keeps it, one seq space bridging events between
+// connect and snapshot.
+func (v *attachView) followInstance(h ctl.Hello) {
+	v.call(func() {
+		v.mu.Lock()
+		changed := v.hello.Token != h.Token
+		v.hello = h
+		v.mu.Unlock()
+		if changed {
+			v.buf = nil
+		}
+	})
+}
+
 // setHeadNow records a head this terminal itself moved over the wire.
 func (v *attachView) setHeadNow(id string) {
 	v.mu.Lock()

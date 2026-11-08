@@ -342,6 +342,56 @@ func TestAttachViewWatermarkDropsStaleEvents(t *testing.T) {
 	assert.NotContains(t, out(), "stale echo")
 }
 
+// TestAttachFollowInstance covers the pre-live buffer across a reconnect: a
+// different serving instance restarts its seqs at 1, so the previous
+// instance's buffered events must drop rather than pass the new watermark.
+func TestAttachFollowInstance(t *testing.T) {
+	t.Run("restarted_instance_drops_buffer", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		a := newAttachRig(t, rig)
+		hello := a.conn.Hello()
+
+		a.view.connDown() // mid-turn drop, no end event
+		a.view.handle(ctl.NewEvent(ctl.EventTextDelta, 30, ctl.TextData{Delta: "stale tail"}))
+		a.view.handle(ctl.NewEvent(ctl.EventTextEnd, 31, nil))
+		a.view.waitIdle()
+
+		restarted := hello
+		restarted.Token = "restarted-instance-token"
+		a.view.followInstance(restarted)
+
+		snap := ctl.State{Head: rig.rec.w.Head()}
+		a.view.send(func() { require.NoError(t, a.view.applyBackfill(snap, nil, 5)) })
+		a.view.waitIdle()
+
+		// live events from the followed instance still paint; once this later
+		// paint is visible, an earlier stale one would be too
+		a.view.handle(ctl.NewEvent(ctl.EventTextDelta, 9, ctl.TextData{Delta: "fresh tail"}))
+		a.view.handle(ctl.NewEvent(ctl.EventTextEnd, 10, nil))
+		require.Eventually(t, func() bool { return strings.Contains(a.out(), "fresh tail") },
+			ctlWait, 5*time.Millisecond)
+		assert.NotContains(t, a.out(), "stale tail")
+	})
+
+	// same serving instance: one seq space, the buffer bridges connect to snapshot
+	t.Run("same_instance_keeps_buffer", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		a := newAttachRig(t, rig)
+
+		a.view.connDown()
+		a.view.handle(ctl.NewEvent(ctl.EventTextDelta, 30, ctl.TextData{Delta: "bridged tail"}))
+		a.view.handle(ctl.NewEvent(ctl.EventTextEnd, 31, nil))
+		a.view.waitIdle()
+
+		a.view.followInstance(a.conn.Hello())
+
+		snap := ctl.State{Head: rig.rec.w.Head()}
+		a.view.send(func() { require.NoError(t, a.view.applyBackfill(snap, nil, 5)) })
+		require.Eventually(t, func() bool { return strings.Contains(a.out(), "bridged tail") },
+			ctlWait, 5*time.Millisecond)
+	})
+}
+
 func TestAttachRedrawKeepsLiveAppends(t *testing.T) {
 	rig := newControlRig(t, func(rec *sessRec) {
 		writeMessage(t, rec, "recorded prompt")

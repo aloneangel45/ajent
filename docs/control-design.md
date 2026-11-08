@@ -273,12 +273,16 @@ the attached terminal can do, a script can do too. Decisions worth keeping:
   holder's open pickers into the same notices. Detaching frees the seat by disconnection and
   never ends the served run, while `/exit` submitted from either side does.
 - **Reconnect is a state machine, not an exit.** A drop without an end event keeps
-  scrollback and the local draft, shows a reconnecting banner and retries with backoff,
-  rediscovering by session id. It prefers the instance it was on, follows a sole surviving
-  instance openly, and picks among several rather than silently switching onto a sibling's
-  head. Submits while reconnecting fail legibly with the editor text preserved. Past a
-  give-up window the terminal exits as a failed turn, so a script can tell a lost session
-  from a clean end, and only a clean end shows the `--resume <name>` hint.
+  scrollback and the local draft, shows a reconnecting banner and retries with backoff on
+  every path, rediscovering by session id over live records only: record-only liveness
+  filters the dead before any dial. It prefers the instance it was on, follows a sole
+  surviving instance openly, and picks among several rather than silently switching onto a
+  sibling's head. Following a different instance drops the terminal's pre-snapshot event
+  buffer, since the new hub restarts its seqs at 1; the same instance keeps it, bridging
+  events between connect and snapshot. Submits while reconnecting fail legibly with the
+  editor text preserved. Past a give-up window the terminal exits as a failed turn, so a
+  script can tell a lost session from a clean end, and only a clean end shows the
+  `--resume <name>` hint.
 - **One goroutine owns the view.** Backfill, live events, redraws and reconnect transitions
   are messages on one queue, so rendering cannot race the reader that feeds it and rendered
   ids reconcile by entry id alone.

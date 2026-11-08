@@ -2,8 +2,13 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,6 +26,7 @@ import (
 	"github.com/jentfoo/ajent/pkg/client"
 	"github.com/jentfoo/ajent/pkg/ctl"
 	"github.com/jentfoo/ajent/pkg/llm"
+	"github.com/jentfoo/ajent/pkg/paths"
 	"github.com/jentfoo/ajent/pkg/session"
 	"github.com/jentfoo/ajent/pkg/tokens"
 	"github.com/jentfoo/ajent/pkg/tui"
@@ -337,6 +343,227 @@ func TestAttachReconnect(t *testing.T) {
 		require.Eventually(t, gaveUp.Load, ctlWait, 5*time.Millisecond)
 		assert.True(t, gaveUp.Load())
 	})
+}
+
+// writeInstanceRecord drops one hand-built discovery record into the session's
+// control directory, the shape a second serving instance would have written.
+// A peer rig's async sweep can remove the still-empty directory between mkdir
+// and write, so a miss recreates and retries.
+func writeInstanceRecord(t *testing.T, sessionID string, in client.Instance) {
+	t.Helper()
+	home, err := paths.Home()
+	require.NoError(t, err)
+	dir := filepath.Join(home, paths.ControlDirName, sessionID)
+	reg := filepath.Join(dir, tokenSuffix(in.Token)+".json")
+	b, err := json.Marshal(in)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(dir, paths.DirPerm))
+	var werr error
+	for range 2 {
+		if werr = os.WriteFile(reg, b, 0o600); werr == nil {
+			return
+		}
+		require.NoError(t, os.MkdirAll(dir, paths.DirPerm))
+	}
+	require.NoError(t, werr)
+}
+
+// countAccepts listens at path, counting connections until the listener closes.
+// The peer gets nothing: a dial lands and fails its hello read, which still
+// proves the dial happened.
+func countAccepts(t *testing.T, path string) *atomic.Int64 {
+	t.Helper()
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "unix", path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	var n atomic.Int64
+	go func() {
+		for {
+			nc, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			n.Add(1)
+			_ = nc.Close()
+		}
+	}()
+	return &n
+}
+
+// reconnectOutcome is one reconnect loop's result pair, for channel delivery.
+type reconnectOutcome struct{ ready, gaveUp bool }
+
+// launchReconnect runs one reconnect loop over a bare view in its goroutine,
+// reporting the outcome once. Cleanup stops it at its next wait.
+func launchReconnect(t *testing.T, hello ctl.Hello) chan reconnectOutcome {
+	t.Helper()
+	term, _ := pipeUI(t)
+	root, stopRoot := context.WithCancel(t.Context())
+	t.Cleanup(stopRoot)
+	view := newAttachView(term, nil, root)
+	quit := make(chan struct{})
+	t.Cleanup(func() { close(quit) })
+	res := make(chan reconnectOutcome, 1)
+	go func() {
+		ready, gaveUp := view.reconnectLoop(term, hello, root, quit)
+		res <- reconnectOutcome{ready, gaveUp}
+	}()
+	return res
+}
+
+// awaitReconnect reads the loop's outcome once it landed.
+func awaitReconnect(t *testing.T, res chan reconnectOutcome) reconnectOutcome {
+	t.Helper()
+	var out reconnectOutcome
+	require.Eventually(t, func() bool {
+		select {
+		case out = <-res:
+			return true
+		default:
+			return false
+		}
+	}, ctlWait, 5*time.Millisecond)
+	return out
+}
+
+// fakePicker swaps the picker seam for fn, restoring it at cleanup.
+func fakePicker(t *testing.T, fn func(context.Context, *tui.UI, []client.Instance, bool) ([]client.Instance, error)) {
+	t.Helper()
+	real := pickInstancesFn
+	pickInstancesFn = fn
+	t.Cleanup(func() { pickInstancesFn = real })
+}
+
+// shrinkBackoff shrinks the reconnect backoff for one test, restoring at cleanup.
+func shrinkBackoff(t *testing.T, first time.Duration) {
+	t.Helper()
+	old := reconnectFirst
+	reconnectFirst = first
+	t.Cleanup(func() { reconnectFirst = old })
+}
+
+// liveRecord builds one discovery record this process vouches for, old enough
+// that record-only liveness judges it alive rather than fresh.
+func liveRecord(sessionID, token, socket string) client.Instance {
+	return client.Instance{SessionID: sessionID, Token: token, Socket: socket,
+		PID: os.Getpid(), StartedAt: time.Now().Add(-2 * time.Minute).UnixMilli()}
+}
+
+// deadRecord is one whose pid this test reaped, old enough to judge dead.
+func deadRecord(t *testing.T, sessionID, token, socket string) client.Instance {
+	t.Helper()
+	gone := exec.CommandContext(t.Context(), "true")
+	require.NoError(t, gone.Run())
+	return client.Instance{SessionID: sessionID, Token: token, Socket: socket,
+		PID: gone.ProcessState.Pid(), StartedAt: time.Now().Add(-2 * time.Minute).UnixMilli()}
+}
+
+func TestReconnectLoopPickerPaths(t *testing.T) {
+	// several live records of the session and a view whose instance is gone:
+	// Followable answers nil, so the picker decides among them. Picker and
+	// backoff seams arm before the launch, so the loop goroutine never races
+	// the swap.
+	setup := func(t *testing.T, pick func(context.Context, *tui.UI, []client.Instance, bool) ([]client.Instance, error)) chan reconnectOutcome {
+		t.Helper()
+		shrinkBackoff(t, 60*time.Millisecond)
+		fakePicker(t, pick)
+		rig := newControlRig(t, nil)
+		sid := rig.hub.Snapshot().SessionID
+		rig.srv.Close("test") // the registry went with it
+		writeInstanceRecord(t, sid, liveRecord(sid, "tokAAAAAAAAAAAAAAAA", "/nonexistent/a"))
+		writeInstanceRecord(t, sid, liveRecord(sid, "tokBBBBBBBBBBBBBBBB", "/nonexistent/b"))
+		return launchReconnect(t, ctl.Hello{Session: ctl.Session{ID: sid}, Token: "origtoken"})
+	}
+
+	// a non-cancel picker failure retries through the backoff wait, never a spin
+	t.Run("picker_error_honors_backoff", func(t *testing.T) {
+		var mu sync.Mutex
+		var calls []time.Time
+		setup(t, func(context.Context, *tui.UI, []client.Instance, bool) ([]client.Instance, error) {
+			mu.Lock()
+			calls = append(calls, time.Now())
+			mu.Unlock()
+			return nil, errors.New("picker broke")
+		})
+
+		require.Eventually(t, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(calls) >= 2
+		}, ctlWait, 5*time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		assert.GreaterOrEqual(t, calls[1].Sub(calls[0]), 60*time.Millisecond)
+	})
+
+	t.Run("picker_cancel_detaches", func(t *testing.T) {
+		res := setup(t, func(context.Context, *tui.UI, []client.Instance, bool) ([]client.Instance, error) {
+			return nil, tui.ErrCancelled
+		})
+
+		out := awaitReconnect(t, res)
+		assert.False(t, out.ready)
+		assert.False(t, out.gaveUp)
+	})
+
+	// the choice adopts the picked token: later rounds dial it without
+	// consulting the picker again
+	t.Run("picker_choice_dials_picked", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		sid := rig.hub.Snapshot().SessionID
+		rig.srv.Close("test")
+		home, err := paths.Home()
+		require.NoError(t, err)
+		base := filepath.Join(home, paths.ControlDirName, sid)
+		// records first: they pin the session dir against another rig's sweep
+		sockA := filepath.Join(base, "aaaaaaaa.sock")
+		sockB := filepath.Join(base, "bbbbbbbb.sock")
+		writeInstanceRecord(t, sid, liveRecord(sid, "tokAAAAAAAAAAAAAAAA", sockA))
+		writeInstanceRecord(t, sid, liveRecord(sid, "tokBBBBBBBBBBBBBBBB", sockB))
+		accepts := []*atomic.Int64{countAccepts(t, sockA), countAccepts(t, sockB)}
+		shrinkBackoff(t, 40*time.Millisecond)
+
+		var mu sync.Mutex
+		var calls int
+		fakePicker(t, func(_ context.Context, _ *tui.UI, list []client.Instance, _ bool) ([]client.Instance, error) {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			return list[:1], nil
+		})
+
+		launchReconnect(t, ctl.Hello{Session: ctl.Session{ID: sid}, Token: "origtoken"})
+		// two dials past the pick prove later rounds follow the picked token alone
+		require.Eventually(t, func() bool {
+			return accepts[0].Load()+accepts[1].Load() >= 2
+		}, ctlWait, 5*time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Equal(t, 1, calls)
+	})
+}
+
+func TestReconnectLoopSkipsDeadRecords(t *testing.T) {
+	rig := newControlRig(t, nil)
+	sid := rig.hub.Snapshot().SessionID
+	rig.srv.Close("test") // the registry went with it
+
+	// the dead record's socket answers dials: only the record-only liveness
+	// filter keeps the loop off it
+	home, err := paths.Home()
+	require.NoError(t, err)
+	base := filepath.Join(home, paths.ControlDirName, sid)
+	sock := filepath.Join(base, "deaddead.sock")
+	writeInstanceRecord(t, sid, deadRecord(t, sid, "tokDEADDEADDEADDEAD", sock))
+	accepts := countAccepts(t, sock)
+	shrinkBackoff(t, 25*time.Millisecond)
+	old := reconnectGiveUp
+	reconnectGiveUp = 200 * time.Millisecond
+	t.Cleanup(func() { reconnectGiveUp = old })
+
+	out := awaitReconnect(t, launchReconnect(t, ctl.Hello{Session: ctl.Session{ID: sid}, Token: "origtoken"}))
+	assert.True(t, out.gaveUp) // rounds elapsed; nothing live was ever dialed
+	assert.Zero(t, accepts.Load())
 }
 
 // attachOnceRig pairs a control rig holding its seat with one freshly dialed

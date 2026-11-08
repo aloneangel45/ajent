@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-analyze/bulk"
+
 	"github.com/jentfoo/ajent/pkg/client"
 	"github.com/jentfoo/ajent/pkg/clipboard"
 	"github.com/jentfoo/ajent/pkg/command"
@@ -23,13 +25,15 @@ const submitBuffer = 16
 
 // Reconnect backoff while the socket is down: first retry delay and its cap.
 const (
-	reconnectFirst = 250 * time.Millisecond
-	reconnectMax   = 5 * time.Second
+	reconnectMax = 5 * time.Second
 
 	// reconnectHintWait is the offline stretch before the attach-again hint
 	// surfaces once. Retries continue at the backoff cap regardless.
 	reconnectHintWait = 30 * time.Second
 )
+
+// reconnectFirst is the first retry delay, a var so tests shrink it.
+var reconnectFirst = 250 * time.Millisecond
 
 // reconnectGiveUp is the offline stretch after which attach stops retrying and
 // exits with a distinct code, so a script can tell a lost session from a clean
@@ -338,9 +342,18 @@ func (v *attachView) reconnectLoop(ui *tui.UI, hello ctl.Hello, root context.Con
 		if time.Since(started) >= reconnectGiveUp {
 			return false, true
 		}
-		live, err := client.Discover()
+		// live records only: record-only liveness already judged the dead ones,
+		// whose sockets would waste the dial below
+		live, err := client.DiscoverLive()
 		if err == nil {
 			follow := client.Followable(live, hello.Session.ID, hello.Token)
+			if len(follow) == 0 {
+				// Followable answers nil for several candidates of the session
+				// as for none; refilter so the picker sees the several
+				follow = bulk.SliceFilter(func(in client.Instance) bool {
+					return in.SessionID == hello.Session.ID
+				}, live)
+			}
 			switch len(follow) {
 			case 1:
 				next := follow[0]
@@ -353,18 +366,18 @@ func (v *attachView) reconnectLoop(ui *tui.UI, hello ctl.Hello, root context.Con
 					// the resnapshot rides attachOnce's backfill, which renders
 					// only the difference against the rendered set
 					v.swapConn(conn)
-					v.setHello(nh)
+					v.followInstance(nh)
 					return true, false
 				}
 			case 0:
 				// none serving yet; fall through to the wait
 			default:
-				picked, perr := pickInstances(root, ui, follow, false)
+				picked, perr := pickInstancesFn(root, ui, follow, false)
 				if perr != nil {
 					if errors.Is(perr, tui.ErrCancelled) {
 						return false, false
 					}
-					continue // picker failed; keep retrying rather than die
+					break // picker failed; the wait below spaces the retry
 				}
 				hello.Token = picked[0].Token // the user chose: follow it like a first attach
 				continue                      // dial through the same path next round
@@ -385,6 +398,9 @@ func (v *attachView) reconnectLoop(ui *tui.UI, hello ctl.Hello, root context.Con
 		backoff = min(backoff*2, reconnectMax)
 	}
 }
+
+// pickInstancesFn is the reconnect picker seam, a var so tests fake the dialog.
+var pickInstancesFn = pickInstances
 
 // pickInstances runs the instance picker, mirroring the resume picker's mental
 // model: workspace, started time, model and seat state per row.
