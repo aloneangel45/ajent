@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/go-analyze/bulk"
@@ -55,7 +56,8 @@ type attachView struct {
 	rendered     map[string]struct{} // committed entry ids this surface already shows
 	pending      []pendingRow        // this terminal's submitted prompts awaiting their entry
 	wireQueued   []ctl.QueueRow      // the last queue copy, for pending merges
-	dialogs      map[uint64]context.CancelFunc
+	dialogs      map[uint64]*openDialog
+	holder       bool        // this connection holds the control seat; only a holder answers dialogs
 	live         bool        // backfill completed; events apply instead of buffering
 	buf          []ctl.Event // events seen before backfill, applied against its watermark
 	redrawQueued bool        // a full repaint is already queued; another head move needs none
@@ -105,6 +107,13 @@ type pendingRow struct {
 	text string
 }
 
+// openDialog is one dialog this surface tracks: the announcement a viewer's
+// notice renders from, and the racer's cancel while this terminal may answer.
+type openDialog struct {
+	data   ctl.InteractionPendingData
+	cancel context.CancelFunc // nil while a viewer only shows the notice
+}
+
 // submitFailed resolves one submission's pending row inline with the reply's
 // error and restores the text, matching the serve-mode prefill rule.
 func (v *attachView) submitFailed(id, line string, err error) {
@@ -121,7 +130,7 @@ func (v *attachView) submitFailed(id, line string, err error) {
 func newAttachView(ui *tui.UI, conn *client.Conn, root context.Context) *attachView {
 	v := &attachView{
 		ui: ui, sink: tuisink.New(ui), conn: conn, root: root,
-		dialogs: make(map[uint64]context.CancelFunc),
+		dialogs: make(map[uint64]*openDialog),
 		msgs:    make(chan func(), 256),
 		closed:  make(chan struct{}),
 	}
@@ -604,25 +613,36 @@ func (v *attachView) setRunning(running bool) {
 	v.ui.SetIdle(!running)
 }
 
-// beginInteraction races a remote dialog against the local human: the first
-// answer wins on the session side, and a settled event cancels this racer. The
-// racer rides parent, the view root on live paths, so teardown takes any
-// still-open one with it rather than whichever request happened to announce
-// the dialog. Idempotent by id: a resnapshot re-listing a dialog already
-// racing here starts nothing new.
+// beginInteraction tracks one open dialog on this surface. A seat holder
+// races a local answer against the remote dialog: the first answer wins on the
+// session side, and a settled event cancels this racer. The racer rides
+// parent, the view root on live paths, so teardown takes any still-open one
+// with it rather than whichever request happened to announce the dialog. A
+// viewer never races, the server refusing its answers: the dialog records
+// itself and surfaces as a notice. Idempotent by id either way, and a dialog
+// first noticed as a viewer races once the seat is held.
 func (v *attachView) beginInteraction(parent context.Context, d ctl.InteractionPendingData) {
-	if _, racing := v.dialogs[d.ID]; racing {
+	dlg, tracked := v.dialogs[d.ID]
+	if tracked && dlg.cancel != nil {
+		return // already racing
+	}
+	if !v.holder {
+		if tracked {
+			return // already noticed
+		}
+		v.dialogs[d.ID] = &openDialog{data: d}
+		v.ui.Notify(heldNotice(d), tui.LevelInfo)
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
-	v.dialogs[d.ID] = cancel
+	v.dialogs[d.ID] = &openDialog{data: d, cancel: cancel}
 	go v.raceDialog(ctx, d)
 }
 
-// reconcileDialogs brings this surface's racers to the snapshot's open set:
-// dialogs still holding the run that no racer serves open locally, and
-// racers whose dialogs settled while this terminal was away cancel. The
-// watermark already dropped their events, so the socket's snapshot is the
+// reconcileDialogs brings this surface's tracked dialogs to the snapshot's
+// open set: dialogs still holding the run that nothing tracks here open for
+// the seat's role, and tracked dialogs the snapshot no longer lists settle.
+// The watermark already dropped their events, so the socket's snapshot is the
 // only word on what still holds. parent seeds any racer it opens; live
 // paths pass the view root, never a request context, so a dialog never
 // dies with the resnapshot that re-announced it.
@@ -684,12 +704,52 @@ func (v *attachView) connFor() *client.Conn {
 	return c
 }
 
-// settleInteraction dismisses one open local dialog whose remote twin settled.
+// settleInteraction dismisses one tracked dialog whose remote twin settled.
 func (v *attachView) settleInteraction(id uint64) {
-	cancel := v.dialogs[id]
+	d := v.dialogs[id]
 	delete(v.dialogs, id)
-	if cancel != nil {
-		cancel()
+	if d != nil && d.cancel != nil {
+		d.cancel()
+	}
+}
+
+// setSeat records whether this connection holds the control seat after a
+// claim. Losing the seat closes racers this terminal can no longer answer and
+// notices what still holds input. The claim's caller queues it ahead of its
+// backfill, so the snapshot's dialogs meet the role they arrived under.
+func (v *attachView) setSeat(control bool) {
+	v.send(func() {
+		if v.holder == control {
+			return
+		}
+		v.holder = control
+		if !control {
+			v.watchDialogs()
+		}
+	})
+}
+
+// seatLost downgrades to a viewer after a forced takeover, naming who drives
+// now. Racers close the way setSeat(false) closes them.
+func (v *attachView) seatLost(to string) {
+	v.setSeat(false)
+	v.ui.Notify("control seat taken by "+seatLabel(to)+"; watching read-only", tui.LevelWarn)
+}
+
+// watchDialogs converts every open racer into a viewer's notice: the server
+// refuses a viewer's answers, so the input UI closes and the dialog stays
+// visible as information instead.
+func (v *attachView) watchDialogs() {
+	ids := bulk.MapKeysSlice(v.dialogs)
+	slices.Sort(ids)
+	for _, id := range ids {
+		d := v.dialogs[id]
+		if d.cancel == nil {
+			continue // already watching
+		}
+		d.cancel()
+		d.cancel = nil
+		v.ui.Notify(heldNotice(d.data), tui.LevelInfo)
 	}
 }
 
@@ -702,7 +762,7 @@ func answerLocal(ctx context.Context, dl localDialogs, d ctl.InteractionPendingD
 
 	opts := d.Options
 	switch d.Kind {
-	case "pick":
+	case kindPick:
 		// silent: the choice's effects announce themselves through wire notices,
 		// so a second local summary line would only duplicate them
 		i, err := dl.PickContext(ctx, d.Prompt, pickItems(opts), tui.PickOptions{Silent: true})
@@ -710,29 +770,29 @@ func answerLocal(ctx context.Context, dl localDialogs, d ctl.InteractionPendingD
 			return noUIOrCancel(err, cancel, skip)
 		}
 		return ctl.ResolveParams{ID: d.ID, Index: &i}, true
-	case "multipick":
+	case kindMultiPick:
 		idx, err := dl.MultiPickContext(ctx, d.Prompt, pickItems(opts), tui.MultiPickOptions{})
 		if err != nil {
 			return noUIOrCancel(err, cancel, skip)
 		}
 		return ctl.ResolveParams{ID: d.ID, Indexes: &idx}, true
-	case "select":
+	case kindSelect:
 		i, err := dl.SelectContext(ctx, d.Prompt, tuiOptions(opts))
 		if err != nil {
 			return noUIOrCancel(err, cancel, skip)
 		}
 		return ctl.ResolveParams{ID: d.ID, Index: &i}, true
-	case "confirm":
+	case kindConfirm:
 		yes, err := dl.ConfirmContext(ctx, d.Prompt)
 		if err != nil {
 			return noUIOrCancel(err, cancel, skip)
 		}
 		i := boolToInt(yes) // "No" is the offered pair's second row
 		return ctl.ResolveParams{ID: d.ID, Index: &i}, true
-	case "input", "secret":
+	case kindInput, kindSecret:
 		var text string
 		var err error
-		if d.Kind == "secret" {
+		if d.Kind == kindSecret {
 			text, err = dl.InputSecretContext(ctx, d.Prompt, "")
 		} else {
 			text, err = dl.InputContext(ctx, d.Prompt, "")
@@ -741,7 +801,7 @@ func answerLocal(ctx context.Context, dl localDialogs, d ctl.InteractionPendingD
 			return noUIOrCancel(err, cancel, skip)
 		}
 		return ctl.ResolveParams{ID: d.ID, Text: &text}, true
-	case "ask":
+	case kindAsk:
 		ans, err := dl.Ask(ctx, tui.Question{Text: d.Prompt, Options: tuiOptions(opts)})
 		if err != nil {
 			return noUIOrCancel(err, cancel, skip)
@@ -757,7 +817,7 @@ func answerLocal(ctx context.Context, dl localDialogs, d ctl.InteractionPendingD
 		default:
 			return ctl.ResolveParams{ID: d.ID, Index: &ans.Index}, true
 		}
-	case "decision":
+	case kindDecision:
 		dec := dl.OpenDecision(tui.DecisionRequest{Prompt: d.Prompt, Context: d.Subject,
 			Options: tuiOptions(opts)})
 		r, err := dec.Wait(ctx)
@@ -787,4 +847,38 @@ func pickItems(opts []string) []tui.PickItem {
 		items[i] = tui.PickItem{Label: o}
 	}
 	return items
+}
+
+// dialogNoun names one dialog kind for a viewer's notice.
+func dialogNoun(kind string) string {
+	switch kind {
+	case kindPick:
+		return "picker"
+	case kindMultiPick:
+		return "multi-pick"
+	case kindSelect:
+		return "choice"
+	case kindConfirm:
+		return "confirmation"
+	case kindInput:
+		return "input"
+	case kindSecret:
+		return "secret input"
+	case kindAsk:
+		return "question"
+	case kindDecision:
+		return "approval"
+	default:
+		return "dialog"
+	}
+}
+
+// heldNotice words one open dialog for a viewer: what holds input and that the
+// answer belongs to the control seat.
+func heldNotice(d ctl.InteractionPendingData) string {
+	text := dialogNoun(d.Kind) + " waiting on the control seat: " + d.Prompt
+	if subj := strutil.Clip(strutil.FirstLine(d.Subject), 60); subj != "" {
+		text += " (" + subj + ")"
+	}
+	return text
 }

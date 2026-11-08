@@ -23,6 +23,18 @@ var (
 // dialogKind names one brokered dialog shape, so a client knows how to answer.
 type dialogKind uint8
 
+// dialog kind names, the wire vocabulary InteractionPendingData.Kind carries.
+const (
+	kindPick      = "pick"
+	kindMultiPick = "multipick"
+	kindSelect    = "select"
+	kindConfirm   = "confirm"
+	kindInput     = "input"
+	kindSecret    = "secret"
+	kindAsk       = "ask"
+	kindDecision  = "decision"
+)
+
 const (
 	dialogPick dialogKind = iota
 	dialogMultiPick
@@ -37,21 +49,21 @@ const (
 func (k dialogKind) String() string {
 	switch k {
 	case dialogPick:
-		return "pick"
+		return kindPick
 	case dialogMultiPick:
-		return "multipick"
+		return kindMultiPick
 	case dialogSelect:
-		return "select"
+		return kindSelect
 	case dialogConfirm:
-		return "confirm"
+		return kindConfirm
 	case dialogInput:
-		return "input"
+		return kindInput
 	case dialogSecret:
-		return "secret"
+		return kindSecret
 	case dialogAsk:
-		return "ask"
+		return kindAsk
 	default:
-		return "decision"
+		return kindDecision
 	}
 }
 

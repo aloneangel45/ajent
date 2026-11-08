@@ -209,7 +209,7 @@ func attachOnce(view *attachView, conn *client.Conn, hello ctl.Hello, holderName
 			var d ctl.SeatLostData
 			if ev.Decode(&d) == nil && d.From == holderName {
 				// force-displaced: downgraded to observer without any write probing it
-				view.ui.Notify("control seat taken by "+seatLabel(d.To)+"; watching read-only", tui.LevelWarn)
+				view.seatLost(d.To)
 			}
 			return
 		}
@@ -229,6 +229,9 @@ func attachOnce(view *attachView, conn *client.Conn, hello ctl.Hello, holderName
 	default:
 		return attachDropped, ""
 	}
+	// queued ahead of the backfill below, so its dialogs reconcile under the
+	// role the claim established
+	view.setSeat(control)
 
 	bctx, bcancel := context.WithTimeout(context.Background(), client.CallWait)
 	berr := view.backfill(bctx)

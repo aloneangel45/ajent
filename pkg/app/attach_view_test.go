@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-analyze/bulk"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -91,7 +90,7 @@ func TestAttachRecallSources(t *testing.T) {
 			writeMessage(t, rec, "first prompt")
 		})
 		term, feed, out := ptyUI(t)
-		a := newAttachRigTerm(t, rig, term, out)
+		a := newAttachRigTerm(t, rig, term, out, false)
 		a.view.installRecall()
 		recallNewest := func(want string) {
 			require.Eventually(t, func() bool {
@@ -124,7 +123,7 @@ func TestAttachRunSearchesHistory(t *testing.T) {
 	})
 
 	term, feed, out := ptyUI(t)
-	a := newAttachRigTerm(t, rig, term, out)
+	a := newAttachRigTerm(t, rig, term, out, false)
 	a.view.installRecall()
 
 	feed("\x12") // ctrl+r opens the search over the wire source
@@ -545,25 +544,23 @@ func TestAttachSnapshotCarriesOpenDialogs(t *testing.T) {
 		require.Eventually(t, func() bool { return len(rig.broker.opened()) == 1 },
 			ctlWait, 5*time.Millisecond)
 
-		a := newAttachRig(t, rig) // attaches after the pending event, snapshot only
+		// the seat claimed at attach: the snapshot's open dialog opens a racer
+		term, out := pipeUI(t)
+		a := newAttachRigTerm(t, rig, term, out, true)
 
-		var ids []uint64
-		a.view.send(func() { // the snapshot's open dialog opened a local racer
-			ids = bulk.MapKeysSlice(a.view.dialogs)
-		})
-		a.view.waitIdle()
-		require.Len(t, ids, 1)
+		id := rig.broker.opened()[0].ID
+		var racing bool
+		a.view.call(func() { racing = a.view.dialogs[id].cancel != nil })
+		require.True(t, racing)
 
 		// the raced dialog answers over the socket; its settled event retires the racer
-		_, err := a.conn.ClaimSeat(t.Context(), "attach-test", false)
-		require.NoError(t, err)
 		i := 1
-		require.NoError(t, a.conn.Resolve(t.Context(), ctl.ResolveParams{ID: ids[0], Index: &i}))
+		require.NoError(t, a.conn.Resolve(t.Context(), ctl.ResolveParams{ID: id, Index: &i}))
 		assert.Equal(t, 1, <-answered)
 		require.Eventually(t, func() bool {
-			var racing bool
-			a.view.call(func() { _, racing = a.view.dialogs[ids[0]] })
-			return !racing
+			var tracked bool
+			a.view.call(func() { _, tracked = a.view.dialogs[id] })
+			return !tracked
 		}, ctlWait, 5*time.Millisecond)
 	})
 
@@ -576,7 +573,8 @@ func TestAttachSnapshotCarriesOpenDialogs(t *testing.T) {
 		parent, done := context.WithCancel(t.Context()) // a parent the resnapshot may seed racers from
 		t.Cleanup(done)
 		a.view.send(func() {
-			a.view.dialogs[9] = cancel           // a racer left over from a dropped connection
+			// a racer left over from a dropped connection
+			a.view.dialogs[9] = &openDialog{cancel: cancel}
 			a.view.reconcileDialogs(parent, nil) // the resnapshot lists nothing open
 			_, racing := a.view.dialogs[9]
 			assert.False(t, racing)
@@ -588,6 +586,7 @@ func TestAttachSnapshotCarriesOpenDialogs(t *testing.T) {
 	t.Run("pending_twice_races_once", func(t *testing.T) {
 		rig := newControlRig(t, nil)
 		a := newAttachRig(t, rig)
+		a.view.setSeat(true)
 
 		a.view.send(func() {
 			d := ctl.InteractionPendingData{ID: 3, Kind: "input", Prompt: "name"}
@@ -600,14 +599,173 @@ func TestAttachSnapshotCarriesOpenDialogs(t *testing.T) {
 	})
 }
 
-func TestAttachSettledCancelsLocalRacer(t *testing.T) {
+// openApproval opens one brokered approval on the rig and reports its id once
+// it holds, standing in for a permission prompt mid-flight.
+func openApproval(t *testing.T, rig *controlRig, subject string) uint64 {
+	t.Helper()
+
+	answered := make(chan int, 1)
+	go func() {
+		dlg, err := rig.broker.OpenDecision(tui.DecisionRequest{
+			Prompt: "allow?", Context: subject,
+			Options: []tui.Option{{Label: "Allow"}, {Label: "Deny"}},
+		})
+		assert.NoError(t, err)
+		idx, werr := dlg.Wait(t.Context()) // test end settles an unanswered one
+		assert.NoError(t, werr)
+		answered <- idx
+	}()
+	require.Eventually(t, func() bool { return len(rig.broker.opened()) == 1 },
+		ctlWait, 5*time.Millisecond)
+	return rig.broker.opened()[0].ID
+}
+
+func TestAttachViewerDialogGating(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
+
+	t.Run("snapshot_notices_without_racer", func(t *testing.T) {
+		rig := newServeRig(t, nil) // no host surface: the dialog holds for a remote answer
+		id := openApproval(t, rig, "rm -rf /tmp/x")
+
+		a := newAttachRig(t, rig) // no seat claimed: a viewer attaches mid-dialog
+
+		require.Eventually(t, func() bool {
+			return strings.Contains(a.out(), "waiting on the control seat")
+		}, ctlWait, 5*time.Millisecond)
+		assert.Contains(t, a.out(), "approval waiting on the control seat: allow? (rm -rf /tmp/x)")
+
+		var racing bool
+		a.view.call(func() { racing = a.view.dialogs[id].cancel != nil })
+		assert.False(t, racing) // no racer goroutine: the viewer can never answer
+
+		// the holder answers elsewhere; the settled event clears the record quietly
+		_, err := a.conn.ClaimSeat(t.Context(), "attach-test", false)
+		require.NoError(t, err)
+		i := 1
+		require.NoError(t, a.conn.Resolve(t.Context(), ctl.ResolveParams{ID: id, Index: &i}))
+		require.Eventually(t, func() bool {
+			var tracked bool
+			a.view.call(func() { _, tracked = a.view.dialogs[id] })
+			return !tracked
+		}, ctlWait, 5*time.Millisecond)
+		assert.NotContains(t, a.out(), "answering failed")
+	})
+
+	t.Run("live_pending_notices_without_racer", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		a := newAttachRig(t, rig) // a viewer throughout
+
+		d := ctl.InteractionPendingData{ID: 2, Kind: "confirm", Prompt: "proceed?"}
+		a.view.handle(ctl.NewEvent(ctl.EventInteractionPending, 1, d))
+
+		require.Eventually(t, func() bool {
+			return strings.Contains(a.out(), "confirmation waiting on the control seat: proceed?")
+		}, ctlWait, 5*time.Millisecond)
+		var racing bool
+		a.view.call(func() { racing = a.view.dialogs[2].cancel != nil })
+		assert.False(t, racing)
+
+		// the re-announce a resnapshot carries never doubles the notice
+		a.view.handle(ctl.NewEvent(ctl.EventInteractionPending, 2, d))
+		a.view.send(func() {
+			a.view.reconcileDialogs(a.view.root, []ctl.InteractionPendingData{d})
+			assert.Equal(t, 1, strings.Count(a.out(), "waiting on the control seat"))
+		})
+		a.view.waitIdle()
+	})
+}
+
+func TestAttachSeatDowngradeClosesRacers(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
 	rig := newControlRig(t, nil)
 	a := newAttachRig(t, rig)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
+	a.view.setSeat(true)
+	a.view.send(func() { // an open racer a takeover must close
+		a.view.dialogs[4] = &openDialog{data: ctl.InteractionPendingData{
+			ID: 4, Kind: "confirm", Prompt: "proceed?"}, cancel: cancel}
+	})
+	a.view.waitIdle()
+
+	a.view.setSeat(false) // the reconnect's claim refused: still a viewer
+	require.Eventually(t, func() bool { return ctx.Err() != nil }, ctlWait, 5*time.Millisecond)
+	var watching bool
+	a.view.call(func() { watching = a.view.dialogs[4].cancel == nil })
+	assert.True(t, watching)
+	assert.Contains(t, a.out(), "confirmation waiting on the control seat: proceed?")
+
+	// the forced-takedown path lands the same downgrade plus its banner
+	a.view.setSeat(true)
+	a.view.seatLost("other attach (pid 7)")
+	require.Eventually(t, func() bool {
+		return strings.Contains(a.out(), `control seat taken by "other attach (pid 7)"; watching read-only`)
+	}, ctlWait, 5*time.Millisecond)
+}
+
+func TestAttachSeatGainRacesOpenDialog(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
+	rig := newControlRig(t, nil)
+	a := newAttachRig(t, rig)
+
+	d := ctl.InteractionPendingData{ID: 8, Kind: "input", Prompt: "name"}
+	a.view.send(func() { a.view.beginInteraction(a.view.root, d) }) // a viewer's notice
+	a.view.waitIdle()
+	require.Eventually(t, func() bool {
+		return strings.Contains(a.out(), "input waiting on the control seat: name")
+	}, ctlWait, 5*time.Millisecond)
+
+	a.view.setSeat(true) // the reconnect reclaimed the seat
+	a.view.send(func() { // and its resnapshot still lists the dialog
+		a.view.reconcileDialogs(a.view.root, []ctl.InteractionPendingData{d})
+		assert.NotNil(t, a.view.dialogs[8].cancel) // racing now
+	})
+	a.view.waitIdle()
+	assert.Equal(t, 1, strings.Count(a.out(), "waiting on the control seat"))
+}
+
+func TestHeldNotice(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		d    ctl.InteractionPendingData
+		want string
+	}{
+		{"approval names subject", ctl.InteractionPendingData{
+			Kind: "decision", Prompt: "Allow `bash` tool call?",
+			Subject: "bash: rm -rf /tmp/x\nmore context",
+		}, "approval waiting on the control seat: Allow `bash` tool call? (bash: rm -rf /tmp/x)"},
+		{"question without subject", ctl.InteractionPendingData{
+			Kind: "ask", Prompt: "which file?",
+		}, "question waiting on the control seat: which file?"},
+		{"unknown kind stays generic", ctl.InteractionPendingData{
+			Kind: "mystery", Prompt: "?",
+		}, "dialog waiting on the control seat: ?"},
+		{"long subject clips", ctl.InteractionPendingData{
+			Kind: "decision", Prompt: "Allow `write` tool call?",
+			Subject: strings.Repeat("x", 80),
+		}, "approval waiting on the control seat: Allow `write` tool call? (" +
+			strings.Repeat("x", 59) + "…)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, heldNotice(tc.d))
+		})
+	}
+}
+
+func TestAttachSettledCancelsLocalRacer(t *testing.T) {
+	rig := newControlRig(t, nil)
+	a := newAttachRig(t, rig)
+	a.view.setSeat(true)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
 	a.view.send(func() { a.view.beginInteraction(a.view.root, ctl.InteractionPendingData{ID: 7}) })
-	a.view.send(func() { a.view.dialogs[7] = cancel }) // swap the racer for a controlled one
+	// swap the racer for a controlled one
+	a.view.send(func() { a.view.dialogs[7] = &openDialog{cancel: cancel} })
 
 	done := make(chan struct{})
 	go func() {

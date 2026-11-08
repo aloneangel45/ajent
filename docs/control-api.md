@@ -462,7 +462,9 @@ an entry arriving both as a live event and through backfill renders once.
   activity rows and queue rows removed while you were away, a spinner whose turn ended without
   its end event surviving the drop), or stale chrome outlives the resnapshot. Open dialogs are
   part of that difference, so a dialog spanning your gap gets re-raced locally instead of
-  stranding the run on a dialog nobody can see.
+  stranding the run on a dialog nobody can see. Re-racing needs the seat: an observer's
+  `interaction.resolve` refuses with `observer`, so an observer surfaces the dialog as held
+  instead.
 - **Open dialogs are state.** Every snapshot lists them exactly as their pending events announced
   them, which is what lets a controller attaching mid-dialog answer by id. They ride the socket
   only: never the transcript, never the discovery record.

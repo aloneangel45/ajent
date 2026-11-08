@@ -46,12 +46,13 @@ func newAttachRig(t *testing.T, rig *controlRig) *attachRig {
 	t.Helper()
 
 	term, out := pipeUI(t)
-	return newAttachRigTerm(t, rig, term, out)
+	return newAttachRigTerm(t, rig, term, out, false)
 }
 
 // newAttachRigTerm is newAttachRig over one chosen terminal, so picker tests
-// can drive the attach surface's own input.
-func newAttachRigTerm(t *testing.T, rig *controlRig, term *tui.UI, out func() string) *attachRig {
+// can drive the attach surface's own input. seat claims the control seat
+// before backfill, mirroring attachOnce's claim-then-backfill order.
+func newAttachRigTerm(t *testing.T, rig *controlRig, term *tui.UI, out func() string, seat bool) *attachRig {
 	t.Helper()
 
 	conn, hello, err := client.Dial(rig.path)
@@ -77,6 +78,12 @@ func newAttachRigTerm(t *testing.T, rig *controlRig, term *tui.UI, out func() st
 		view.handle(ev)
 	})
 
+	if seat {
+		_, err := conn.ClaimSeat(t.Context(), "attach-rig", false)
+		require.NoError(t, err)
+		view.setSeat(true)
+	}
+
 	require.NoError(t, view.backfill(t.Context()))
 	return a
 }
@@ -99,7 +106,7 @@ func TestAttachRewindPicker(t *testing.T) {
 		wireAttachRewind(t, rig)
 
 		term, _, _ := pipeInputUI(t)
-		a := newAttachRigTerm(t, rig, term, func() string { return "" })
+		a := newAttachRigTerm(t, rig, term, func() string { return "" }, false)
 
 		_, err := a.conn.ClaimSeat(t.Context(), "test", false)
 		require.NoError(t, err)
@@ -139,7 +146,7 @@ func TestAttachRewindPicker(t *testing.T) {
 		wireAttachRewind(t, rig)
 
 		term, feed, out := pipeInputUI(t)
-		a := newAttachRigTerm(t, rig, term, out)
+		a := newAttachRigTerm(t, rig, term, out, false)
 
 		_, err := a.conn.ClaimSeat(t.Context(), "test", false)
 		require.NoError(t, err)
@@ -178,7 +185,7 @@ func TestAttachRewindPicker(t *testing.T) {
 		wireAttachRewind(t, rig)
 
 		term, feed, out := ptyUI(t)
-		a := newAttachRigTerm(t, rig, term, out)
+		a := newAttachRigTerm(t, rig, term, out, false)
 
 		_, err := a.conn.ClaimSeat(t.Context(), "test", false)
 		require.NoError(t, err)
@@ -235,7 +242,7 @@ func TestAttachRewindFillsEditor(t *testing.T) {
 	wireAttachRewind(t, rig)
 
 	term, feed, out := ptyUI(t)
-	a := newAttachRigTerm(t, rig, term, out)
+	a := newAttachRigTerm(t, rig, term, out, false)
 
 	_, err := a.conn.ClaimSeat(t.Context(), "test", false)
 	require.NoError(t, err)
@@ -254,7 +261,7 @@ func TestAttachRewindFillsEditor(t *testing.T) {
 func TestAttachQueueRecallFillsEditor(t *testing.T) {
 	rig := newControlRig(t, nil)
 	term, feed, out := ptyUI(t)
-	a := newAttachRigTerm(t, rig, term, out)
+	a := newAttachRigTerm(t, rig, term, out, false)
 
 	// park two prompts as rows, the way a gate hold leaves them
 	rig.hub.q = newSteerQueue(rig.hub.ui, func(int) {},
@@ -283,7 +290,7 @@ func TestAttachReconnect(t *testing.T) {
 	t.Run("refuses_submits", func(t *testing.T) {
 		rig := newControlRig(t, nil)
 		term, feed, out := ptyUI(t)
-		a := newAttachRigTerm(t, rig, term, out)
+		a := newAttachRigTerm(t, rig, term, out, false)
 
 		rig.srv.Close("test") // the registry went with it: nothing to follow
 		root, stopRoot := context.WithCancel(t.Context())
@@ -312,7 +319,7 @@ func TestAttachReconnect(t *testing.T) {
 	t.Run("gives_up_after_window", func(t *testing.T) {
 		rig := newControlRig(t, nil)
 		term, _, out := ptyUI(t)
-		a := newAttachRigTerm(t, rig, term, out)
+		a := newAttachRigTerm(t, rig, term, out, false)
 
 		rig.srv.Close("test") // the registry went with it: nothing to follow
 		old := reconnectGiveUp

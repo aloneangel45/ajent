@@ -175,8 +175,9 @@ one exception below.
 **Open dialogs are state, not paint.** A dialog holding the run cannot be an event a late
 arrival misses, so every snapshot lists the interactions still open, exactly as their
 pending events announced them. A controller that attaches mid-dialog learns what holds
-input and can answer it by id. A reconnecting one re-races locally what it still lists
-and cancels racers whose dialogs settled while it was away. Reconciliation stays the one
+input and can answer it by id. A reconnecting holder re-races locally what it still lists
+and cancels racers whose dialogs settled while it was away; a viewer never races, the
+seat refusing its answers, so it reports what holds instead. Reconciliation stays the one
 watermark rule, by dialog id. Open dialogs ride the socket only: never the transcript
 (they are runtime state, not history) and never the discovery record (which stays static
 facts for pickers).
@@ -199,8 +200,9 @@ The difference cuts both ways: the snapshot's applier also clears what the new s
 longer lists (segments, activity rows and queue rows removed while the terminal was away,
 and a spinner whose turn ended without its end event surviving the drop), so stale chrome
 cannot outlive the resnapshot. The snapshot's open dialogs are part of that difference,
-so a dialog spanning a drop re-races instead of stranding the run on a dialog nobody
-attached can see.
+so a dialog spanning a drop re-races for the seat holder instead of stranding the run on
+a dialog nobody attached can see; a viewer re-reports it as held, since the seat refuses
+its answers.
 
 Delivery is fail-open and bounded. Each connection stages outbound lines behind its own
 queue, and a peer that stops reading loses its connection instead of stalling the turn
@@ -265,7 +267,10 @@ the attached terminal can do, a script can do too. Decisions worth keeping:
   keeps its list until the episode ends, so a recalled prompt never jumps under the
   user's thumbs.
 - **The seat degrades honestly.** Attach claims the seat, or attaches as a named read-only
-  viewer when another controller holds it. Detaching frees the seat by disconnection and
+  viewer when another controller holds it. Only a holder opens answer-capable local
+  dialogs: a viewer's picker would always error on answer, so an open dialog surfaces to
+  it as a notice naming what holds input, and a forced takeover closes the displaced
+  holder's open pickers into the same notices. Detaching frees the seat by disconnection and
   never ends the served run, while `/exit` submitted from either side does.
 - **Reconnect is a state machine, not an exit.** A drop without an end event keeps
   scrollback and the local draft, shows a reconnecting banner and retries with backoff,
@@ -331,8 +336,8 @@ prompts verbatim, so redaction covers the live surfaces only.
    inventory.
 5. Committed content is entry appends plus branch changes, reconciled by entry id alone.
    Everything else is ephemeral, governed by the watermark and never reconciled against the
-   file, except open dialogs: they hold the run, so every snapshot lists them and every
-   surface re-races what it lists.
+   file, except open dialogs: they hold the run, so every snapshot lists them; the seat
+   holder re-races what it lists, a viewer only reports what holds.
 6. A live append paints exactly what replay paints for the same entry: one echo rule,
    defined beside replay, feeds committed history and live appends alike.
 7. Delivery is fail-open: a slow peer loses its connection, never the session's turn, and the
