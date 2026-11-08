@@ -618,6 +618,19 @@ func (a *attachOnceRig) awaitOutcome(t *testing.T) attachOutcome {
 	return o
 }
 
+// reconnect drops the wire and dials again on the same view, the shape
+// RunAttach's loop drives between attach attempts after a dropped socket.
+func (a *attachOnceRig) reconnect(t *testing.T) {
+	t.Helper()
+	a.conn.Close() // the old reader ends with it
+	conn, hello, err := client.Dial(a.rig.path)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	a.conn = conn
+	a.hello = hello
+	a.view.swapConn(conn)
+}
+
 func TestAttachOnceSeatClaim(t *testing.T) {
 	t.Run("force_takes_held_seat", func(t *testing.T) {
 		rig := newControlRig(t, nil)
@@ -670,6 +683,111 @@ func TestAttachOnceSeatClaim(t *testing.T) {
 
 		close(a.quit)
 		assert.Equal(t, attachDetached, a.awaitOutcome(t))
+	})
+}
+
+// TestAttachSeatRegainNotice walks the seat transitions an attach terminal can
+// hit: notices must cover every change it can see, and the one silent corner —
+// a reconnect handing a refused or taken seat back — names it (control-10).
+func TestAttachSeatRegainNotice(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
+
+	t.Run("holder_eof_keeps_viewer_silent", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		holder := dialControl(t, rig.path)
+		holder.hello()
+		attachControl(t, holder, "first")
+
+		a := newAttachOnceRig(t, rig)
+		a.run(false) // blocked at attach: a viewer
+		require.Eventually(t, func() bool {
+			return strings.Contains(a.out(), "watching read-only")
+		}, ctlWait, 5*time.Millisecond)
+
+		// the holder's EOF frees the seat for anyone; this terminal never
+		// re-claims while connected, so nothing arrives and it stays a viewer
+		require.NoError(t, holder.conn.Close())
+		rig.awaitSeatFree(t)
+		assert.NotContains(t, a.out(), "you hold the control seat")
+
+		// its current state still answers a write attempt, now naming nobody
+		sctx, scancel := context.WithTimeout(context.Background(), client.CallWait)
+		err := a.conn.Submit(sctx, ctl.SubmitParams{Line: "anyone there?"})
+		scancel()
+		var wire *ctl.Error
+		require.ErrorAs(t, err, &wire)
+		assert.Equal(t, ctl.CodeObserver, wire.Code)
+		assert.Contains(t, wire.Message, "nobody holds the control seat")
+
+		close(a.quit)
+		assert.Equal(t, attachDetached, a.awaitOutcome(t))
+	})
+
+	// a blocked viewer whose blocker leaves during a reconnect gap gains the
+	// seat: the flip must be announced against the read-only notice before it
+	t.Run("promoted_after_blocker_leaves", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		holder := dialControl(t, rig.path)
+		holder.hello()
+		attachControl(t, holder, "first")
+
+		a := newAttachOnceRig(t, rig)
+		a.run(false)
+		require.Eventually(t, func() bool {
+			return strings.Contains(a.out(), "watching read-only")
+		}, ctlWait, 5*time.Millisecond)
+
+		close(a.quit)
+		assert.Equal(t, attachDetached, a.awaitOutcome(t))
+
+		require.NoError(t, holder.conn.Close()) // the seat frees while offline
+		rig.awaitSeatFree(t)
+
+		a.reconnect(t)
+		a.run(false) // the same plain claim now succeeds
+		require.Eventually(t, func() bool {
+			return strings.Contains(a.out(), "you hold the control seat")
+		}, ctlWait, 5*time.Millisecond)
+
+		var held bool
+		a.view.call(func() { held = a.view.holder }) // setSeat ran before any notice
+		assert.True(t, held)
+	})
+
+	// a force attach displaced mid-session reconnects with the same force and
+	// takes the seat back; both directions of the takeover name themselves
+	t.Run("force_reclaims_after_displacement", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		first := dialControl(t, rig.path)
+		first.hello()
+		attachControl(t, first, "first")
+
+		a := newAttachOnceRig(t, rig)
+		a.run(true) // takes the held seat: no read-only news to correct
+		require.Eventually(t, func() bool {
+			return strings.Contains(a.out(), "attached to session")
+		}, ctlWait, 5*time.Millisecond)
+		assert.NotContains(t, a.out(), "you hold the control seat")
+
+		// displaced over the wire: the seat.lost event matches this terminal's
+		// holder name and downgrades it with its banner
+		second := dialControl(t, rig.path)
+		second.hello()
+		rp := second.call("force", ctl.MethodAttach,
+			map[string]any{"control": true, "holder": "second", "force": true})
+		require.Nil(t, rp.Error)
+		require.Eventually(t, func() bool {
+			return strings.Contains(a.out(), `control seat taken by "second"; watching read-only`)
+		}, ctlWait, 5*time.Millisecond)
+
+		close(a.quit)
+		assert.Equal(t, attachDetached, a.awaitOutcome(t))
+
+		a.reconnect(t)
+		a.run(true) // force rides every claim of the run: it takes the seat back
+		require.Eventually(t, func() bool {
+			return strings.Contains(a.out(), "you hold the control seat")
+		}, ctlWait, 5*time.Millisecond)
 	})
 }
 

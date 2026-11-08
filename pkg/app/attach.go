@@ -243,6 +243,9 @@ func attachOnce(view *attachView, conn *client.Conn, hello ctl.Hello, holderName
 	default:
 		return attachDropped, ""
 	}
+	// a claim that hands back a refused or taken seat says so: silence would
+	// make this terminal the controller while its last notice claimed read-only
+	regained := control && view.takeDemoted()
 	// queued ahead of the backfill below, so its dialogs reconcile under the
 	// role the claim established
 	view.setSeat(control)
@@ -258,6 +261,8 @@ func attachOnce(view *attachView, conn *client.Conn, hello ctl.Hello, holderName
 	ui.Notify(fmt.Sprintf("attached to session %s (host pid %d)", resumeLabel(hello), hello.PID), tui.LevelInfo)
 	if !control {
 		ui.Notify("watching read-only: writes need the control seat", tui.LevelWarn)
+	} else if regained {
+		ui.Notify("you hold the control seat", tui.LevelInfo)
 	}
 
 	view.waitIdle() // the backfill snapshot owns idle, running chrome included

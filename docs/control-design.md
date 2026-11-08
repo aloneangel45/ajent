@@ -278,11 +278,14 @@ the attached terminal can do, a script can do too. Decisions worth keeping:
   keeps its list until the episode ends, so a recalled prompt never jumps under the
   user's thumbs.
 - **The seat degrades honestly.** Attach claims the seat, or attaches as a named read-only
-  viewer when another controller holds it. Only a holder opens answer-capable local
-  dialogs: a viewer's picker would always error on answer, so an open dialog surfaces to
-  it as a notice naming what holds input, and a forced takeover closes the displaced
-  holder's open pickers into the same notices. Detaching frees the seat by disconnection and
-  never ends the served run, while `/exit` submitted from either side does.
+  viewer when another controller holds it, and every change it can see names itself: the
+  attach-time notice, refusals naming the holder (or nobody) on any write attempt, the
+  forced-takeover announcement, and a reconnect that hands a refused or taken seat back,
+  so no terminal flips into control against its last seat message. Only a holder opens
+  answer-capable local dialogs: a viewer's picker would always error on answer, so an open
+  dialog surfaces to it as a notice naming what holds input, and a forced takeover closes
+  the displaced holder's open pickers into the same notices. Detaching frees the seat by
+  disconnection and never ends the served run, while `/exit` submitted from either side does.
 - **Reconnect is a state machine, not an exit.** A drop without an end event keeps
   scrollback and the local draft, shows a reconnecting banner and retries with backoff on
   every path, rediscovering by session id over live records only: record-only liveness

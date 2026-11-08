@@ -58,6 +58,7 @@ type attachView struct {
 	wireQueued   []ctl.QueueRow      // the last queue copy, for pending merges
 	dialogs      map[uint64]*openDialog
 	holder       bool        // this connection holds the control seat; only a holder answers dialogs
+	demoted      bool        // the last seat news was read-only: a later regain owes its own notice
 	live         bool        // backfill completed; events apply instead of buffering
 	buf          []ctl.Event // events seen before backfill, applied against its watermark
 	redrawQueued bool        // a full repaint is already queued; another head move needs none
@@ -732,10 +733,15 @@ func (v *attachView) settleInteraction(id uint64) {
 
 // setSeat records whether this connection holds the control seat after a
 // claim. Losing the seat closes racers this terminal can no longer answer and
-// notices what still holds input. The claim's caller queues it ahead of its
-// backfill, so the snapshot's dialogs meet the role they arrived under.
+// notices what still holds input, remembering the downgrade so a later regain
+// can correct it. The claim's caller queues it ahead of its backfill, so the
+// snapshot's dialogs meet the role they arrived under.
 func (v *attachView) setSeat(control bool) {
 	v.send(func() {
+		if !control {
+			// every downgrade renders a read-only notice; a reclaim must answer it
+			v.demoted = true
+		}
 		if v.holder == control {
 			return
 		}
@@ -744,6 +750,17 @@ func (v *attachView) setSeat(control bool) {
 			v.watchDialogs()
 		}
 	})
+}
+
+// takeDemoted reports whether this user was last told they watch read-only,
+// clearing it so a regained seat announces itself once per loss.
+func (v *attachView) takeDemoted() bool {
+	var due bool
+	v.call(func() {
+		due = v.demoted
+		v.demoted = false
+	})
+	return due
 }
 
 // seatLost downgrades to a viewer after a forced takeover, naming who drives
