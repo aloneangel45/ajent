@@ -47,7 +47,7 @@ func main() {
 		os.Exit(app.RunDelete(os.Stdout, os.Stdin, app.DeleteOptions{
 			Target:  f.deleteTarget,
 			OldDays: f.deleteOldDays,
-			Force:   f.deleteForce,
+			Force:   f.force,
 		}))
 	}
 

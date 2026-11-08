@@ -114,6 +114,7 @@ type RunOptions struct {
 	Serve       bool     // --serve: run with the control socket as the only front end
 	Attach      string   // --attach [name|id|socket]: mirror that session's control socket
 	AttachGiven bool     // --attach was given, bare or with a target
+	Force       bool     // --force: with --attach take the control seat from its holder
 
 	SessMode     ResumeMode
 	SessTarget   string
@@ -144,4 +145,5 @@ type AttachOptions struct {
 	Images   string
 	Keymap   tui.Keymap
 	Warnings []string
+	Force    bool // --force: take the control seat from its live holder
 }

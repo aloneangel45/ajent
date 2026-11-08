@@ -83,6 +83,7 @@ func Run(o RunOptions) int {
 		return RunAttach(AttachOptions{
 			Socket: o.Attach, Mode: mode, Color: color,
 			Palette: pal, Images: imagesName, Keymap: keymap, Warnings: warnings,
+			Force: o.Force,
 		})
 	}
 

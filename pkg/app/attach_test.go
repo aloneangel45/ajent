@@ -332,6 +332,113 @@ func TestAttachReconnect(t *testing.T) {
 	})
 }
 
+// attachOnceRig pairs a control rig holding its seat with one freshly dialed
+// attach connection, the way RunAttach wires attachOnce: no reader started,
+// hello recorded on the view.
+type attachOnceRig struct {
+	rig     *controlRig
+	conn    *client.Conn
+	view    *attachView
+	hello   ctl.Hello
+	out     func() string
+	quit    chan struct{}
+	outcome chan attachOutcome
+}
+
+func newAttachOnceRig(t *testing.T, rig *controlRig) *attachOnceRig {
+	t.Helper()
+
+	term, out := pipeUI(t)
+	conn, hello, err := client.Dial(rig.path)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	root, stopRoot := context.WithCancel(t.Context())
+	t.Cleanup(stopRoot)
+	view := newAttachView(term, conn, root)
+	view.setHello(hello) // RunAttach records the greeting too; backfill reads it
+	return &attachOnceRig{rig: rig, conn: conn, view: view, hello: hello,
+		out: out, quit: make(chan struct{}), outcome: make(chan attachOutcome, 1)}
+}
+
+// run launches attachOnce in its goroutine; close quit to detach it.
+func (a *attachOnceRig) run(force bool) {
+	go func() {
+		o, _ := attachOnce(a.view, a.conn, a.hello, "forced attach (pid 99)", force,
+			make(chan string, submitBuffer), a.quit)
+		a.outcome <- o
+	}()
+}
+
+// awaitOutcome drains the outcome channel once quit has closed the loop.
+func (a *attachOnceRig) awaitOutcome(t *testing.T) attachOutcome {
+	t.Helper()
+	var o attachOutcome
+	require.Eventually(t, func() bool {
+		select {
+		case o = <-a.outcome:
+			return true
+		default:
+			return false
+		}
+	}, ctlWait, 5*time.Millisecond)
+	return o
+}
+
+func TestAttachOnceSeatClaim(t *testing.T) {
+	t.Run("force_takes_held_seat", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		holder := dialControl(t, rig.path)
+		holder.hello()
+		attachControl(t, holder, "first")
+
+		a := newAttachOnceRig(t, rig)
+		a.run(true)
+
+		// the takeover announces to every connection, naming both sides of it
+		var lost ctl.SeatLostData
+		require.Eventually(t, func() bool {
+			select {
+			case in, ok := <-holder.inc:
+				if !ok {
+					return false
+				}
+				if in.Event != nil && in.Event.Name == ctl.EventSeatLost {
+					require.NoError(t, in.Event.Decode(&lost))
+					return true
+				}
+				return false // hello and attach replies pass through here
+			default:
+				return false
+			}
+		}, ctlWait, 5*time.Millisecond)
+		assert.Equal(t, "first", lost.From)
+		assert.Equal(t, "forced attach (pid 99)", lost.To)
+
+		close(a.quit)
+		assert.Equal(t, attachDetached, a.awaitOutcome(t))
+		// control landed: the observer notice never rendered
+		assert.NotContains(t, a.out(), "watching read-only")
+	})
+
+	// without force a held seat downgrades this attach to observer, as before
+	t.Run("held_seat_stays_observer", func(t *testing.T) {
+		rig := newControlRig(t, nil)
+		holder := dialControl(t, rig.path)
+		holder.hello()
+		attachControl(t, holder, "first")
+
+		a := newAttachOnceRig(t, rig)
+		a.run(false)
+
+		require.Eventually(t, func() bool {
+			return strings.Contains(a.out(), "watching read-only")
+		}, ctlWait, 5*time.Millisecond)
+
+		close(a.quit)
+		assert.Equal(t, attachDetached, a.awaitOutcome(t))
+	})
+}
+
 // captureStderr runs fn with os.Stderr swapped for a pipe, returning what it wrote.
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()

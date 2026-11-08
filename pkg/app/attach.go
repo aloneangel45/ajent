@@ -124,7 +124,7 @@ func RunAttach(o AttachOptions) int {
 			view.setHello(hello)
 		}
 
-		outcome, exitReason := attachOnce(view, conn, hello, holderName, submissions, quit)
+		outcome, exitReason := attachOnce(view, conn, hello, holderName, o.Force, submissions, quit)
 		conn.Close()
 
 		switch outcome {
@@ -183,8 +183,9 @@ func resumeLabel(h ctl.Hello) string {
 
 // attachOnce runs one attach session to an outcome: backfill, seat claim, the
 // event pump and the input loop. The reason is set only when the session
-// itself exited.
-func attachOnce(view *attachView, conn *client.Conn, hello ctl.Hello, holderName string,
+// itself exited. Every claim of the run rides force, so a dropped connection
+// reclaims the seat it asked for at launch rather than returning an observer.
+func attachOnce(view *attachView, conn *client.Conn, hello ctl.Hello, holderName string, force bool,
 	submissions chan<- string, quit <-chan struct{}) (attachOutcome, string) {
 	var exitReason string
 	onExit := make(chan struct{}) // closed once per connection on session.exit
@@ -218,7 +219,7 @@ func attachOnce(view *attachView, conn *client.Conn, hello ctl.Hello, holderName
 	// the seat claim carries the standard request budget: a wedged-but-alive
 	// host fails into the reconnect loop instead of hanging before any banner
 	cctx, ccancel := context.WithTimeout(context.Background(), client.CallWait)
-	control, err := conn.ClaimSeat(cctx, holderName, false)
+	control, err := conn.ClaimSeat(cctx, holderName, force)
 	ccancel()
 	var wire *ctl.Error
 	switch {

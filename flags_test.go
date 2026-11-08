@@ -231,10 +231,12 @@ func TestCliFlagsValidate(t *testing.T) {
 		{"attach_with_prompt", []string{"--attach", "shared", "-p", "hi"}, false},
 		{"attach_with_positional", []string{"--attach", "shared", "extra"}, false},
 		{"attach_with_serve", []string{"--attach", "shared", "--serve"}, false},
+		{"attach_with_force", []string{"--attach", "/x.sock", "--force"}, true},
 		{"delete_old_bare", []string{"--delete-old"}, true},
 		{"delete_old_with_days", []string{"--delete-old", "7"}, true},
 		{"delete_old_with_force", []string{"--delete-old", "--force"}, false},
-		{"force_without_delete", []string{"--force"}, false},
+		{"bare_force", []string{"--force"}, false},
+		{"serve_with_force", []string{"--serve", "--force"}, false},
 		{"delete_with_model", []string{"--delete", "a", "-m", "p/m"}, true},
 		{"empty_delete_target", []string{"--delete", "  "}, false},
 		{"delete_with_delete_old", []string{"--delete", "a", "--delete-old"}, false},
@@ -325,6 +327,20 @@ func TestCliFlagsValidate(t *testing.T) {
 				require.Error(t, verr)
 				assert.Contains(t, verr.Error(), tc.match)
 			})
+		}
+	})
+
+	// --force means nothing beside the modes that have no seat to take and no
+	// transcript to remove; the shared refusal sits above every early-returning
+	// block, so serve cannot silently ignore it either
+	t.Run("force_refused_outside_modes", func(t *testing.T) {
+		for _, argv := range [][]string{
+			{"--serve", "--force"},
+			{"-p", "hi", "--force"},
+		} {
+			f, err := parseFlags(argv)
+			require.NoError(t, err)
+			require.EqualError(t, f.validate(), "--force only applies to --delete or --attach")
 		}
 	})
 }

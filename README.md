@@ -268,8 +268,9 @@ The CLI is deliberately small. Run `ajent --help` for the full list, and the imp
                        control socket
     --attach <name|id> mirror a running session on this terminal and
                        interact with it from either process
-    --force            with --delete: remove a session even while another
-                       ajent instance holds it live
+    --force            with --delete: remove the session even while another
+                       ajent instance holds it live; with --attach: take
+                       the control seat from its holder
 ```
 
 Sessions are normally identified by an opaque id, and `--resume` takes the full id or any unique prefix of it. `--session <name>` adds a human-readable name instead: the first run creates that session and every later one resumes it, so `--resume <name>` reaches it too. `/session <name>` names or renames the running session, and `/session` alone reports its name. When a named session ends, the exit hint prints `ajent --resume <name>` rather than its id.
@@ -308,8 +309,9 @@ streaming output, tool activity and status live, and every input works from
 either side — prompts, slash commands and `!shell` submit remotely, Esc and
 ctrl+c interrupt, Shift+Tab cycles the permission mode, double-Esc rewinds,
 and dialogs (approval prompts included) open in both terminals with the first
-answer winning. Attach claims the control seat; if another controller holds it
-the second process attaches as a read-only viewer instead. Detaching is local
+answer winning. Attach claims the control seat; if another controller holds it,
+`--force` takes the seat from that holder, announced to every attached terminal,
+and without it the second process attaches as a read-only viewer instead. Detaching is local
 to the attached terminal: ctrl+c twice leaves the session running, and only
 `/exit` (from either side) ends it. The target resolves like `--resume` does:
 an exact name, a full id or a unique prefix; bare `--attach` opens a picker of

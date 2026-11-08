@@ -39,7 +39,7 @@ type cliFlags struct {
 
 	deleteTarget  string // --delete <name|id>: the session to remove from disk
 	deleteGiven   bool   // --delete was given, so an empty target is a usage error
-	deleteForce   bool   // --force: delete a live session's transcript anyway
+	force         bool   // --force: with --delete remove a live transcript anyway; with --attach take the control seat
 	deleteOld     bool   // --delete-old: sweep unnamed sessions unused past the cutoff
 	deleteOldDays int    // days from --delete-old <days>, 0 when the default applies
 
@@ -102,8 +102,9 @@ func parseFlags(argv []string) (cliFlags, error) {
 	fs.BoolVar(&f.serve, "serve", false,
 		"run with no terminal, serving the session over the local control socket")
 	fs.StringVar(&f.deleteTarget, "delete", "", "delete the saved session with this name or id, then exit")
-	fs.BoolVar(&f.deleteForce, "force", false,
-		"with --delete: remove the session even while another ajent instance holds it live")
+	fs.BoolVar(&f.force, "force", false,
+		"with --delete: remove the session even while another ajent instance holds it live; "+
+			"with --attach: take the control seat from its holder")
 	fs.BoolVarP(&f.version, "version", "v", false, "print version and exit")
 	fs.BoolVar(&f.update, "update", false, "reinstall ajent from @latest then exit")
 	fs.StringVarP(&f.prompt, "prompt", "p", "",
@@ -177,7 +178,7 @@ func (f cliFlags) validate() error {
 		case f.deleteOld && f.deleteOldDays < 1:
 			// a cutoff at or past now would sweep every unnamed session
 			return errors.New("--delete-old needs a positive number of days")
-		case f.deleteOld && f.deleteForce:
+		case f.deleteOld && f.force:
 			// the sweep skips live rows rather than forcing over them
 			return errors.New("--force only applies to --delete; --delete-old never deletes a live session")
 		case f.deleteOld && len(f.args) > 0:
@@ -188,6 +189,11 @@ func (f cliFlags) validate() error {
 			return errors.New("--delete and --delete-old cannot be combined with a session or prompt flag")
 		}
 		return nil
+	}
+	// --force only means something beside --delete or --attach; the check sits
+	// above every early-returning mode block so serve cannot silently ignore it
+	if f.force && !f.deleteGiven && !f.attachGiven {
+		return errors.New("--force only applies to --delete or --attach")
 	}
 	// --session already means create-or-resume, so another resume mode contradicts it
 	if f.sessionGiven {
@@ -230,9 +236,6 @@ func (f cliFlags) validate() error {
 	}
 	if f.noTools && (len(f.allowTools) > 0 || len(f.denyTools) > 0) {
 		return errors.New("--no-tools withholds the whole set, so --allow-tools and --deny-tools name nothing to allow or deny")
-	}
-	if f.deleteForce && !f.deleteGiven {
-		return errors.New("--force only applies to --delete")
 	}
 	if f.serve {
 		switch {
