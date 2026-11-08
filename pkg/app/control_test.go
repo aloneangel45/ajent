@@ -3,10 +3,12 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -568,6 +570,98 @@ func TestControlCloseDrainsLanes(t *testing.T) {
 	releaseVerb.Do(func() { close(verbRelease) })
 	require.Eventually(t, exited.Load, 5*time.Second, 5*time.Millisecond)
 	<-closed
+}
+
+// serverConns snapshots the server's live connections for direct writer asserts.
+func serverConns(srv *controlServer) []*controlConn {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return slices.Collect(maps.Keys(srv.conns))
+}
+
+// floodStage publishes several megabytes of notices, the volume a non-reading
+// peer's kernel buffer cannot swallow: it stays in the stage behind a stalled
+// writer. 200 items stay under the soft item bound, so no drop ever fires.
+func floodStage(hub *sessionHub) {
+	for i := 0; i < 200; i++ {
+		hub.publish(ctl.EventNotice, ctl.NoticeData{Text: strings.Repeat("x", 24<<10)})
+	}
+}
+
+// TestControlCloseJoinsWriters pins the exit guarantee's mechanism: Close can
+// only return once every writer drained its stage into the socket.
+func TestControlCloseJoinsWriters(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
+	rig := newServeRig(t, nil)
+	c := dialControl(t, rig.path)
+	c.hello()
+	floodStage(rig.hub)
+	conns := serverConns(rig.srv)
+	require.Len(t, conns, 1)
+
+	rig.srv.Close("done")
+
+	select {
+	case <-conns[0].wrote:
+	default:
+		assert.Fail(t, "Close returned before the writer drained its stage")
+	}
+}
+
+// TestControlCloseBoundedStalledPeer pins the fail-open half: a peer that
+// never reads holds megabytes in the writer's blocked flush, and shutdown
+// still returns on its bound with the writer mid-drain.
+func TestControlCloseBoundedStalledPeer(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
+	rig := newServeRig(t, nil)
+	raw, err := (&net.Dialer{}).DialContext(t.Context(), "unix", rig.path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() }) // never read: the kernel buffer stays full
+	floodStage(rig.hub)
+	conns := serverConns(rig.srv)
+	require.Len(t, conns, 1)
+
+	start := time.Now()
+	rig.srv.Close("done")
+	assert.Less(t, time.Since(start), 2*time.Second, "shutdown extended past its bound")
+
+	// the writer cannot have finished without a reader, so it lost fail-open:
+	// Close gave up on it rather than wait
+	select {
+	case <-conns[0].wrote:
+	default:
+		return
+	}
+	assert.Fail(t, "stalled peer's writer finished before the bound")
+}
+
+// TestControlCloseDeliversExitBeforeEOF pins what an attached terminal sees at
+// shutdown: the full backlog, session.exit last of all, then EOF. The peer
+// reads nothing until Close has run, the slow-but-reading shape.
+func TestControlCloseDeliversExitBeforeEOF(t *testing.T) {
+	// not parallel: the rig pins AJENT_HOME
+	rig := newServeRig(t, nil)
+	raw, err := (&net.Dialer{}).DialContext(t.Context(), "unix", rig.path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	dec := ctl.NewDecoder(raw)
+	floodStage(rig.hub)
+
+	rig.srv.Close("done")
+
+	var sawExit bool
+	for {
+		line, rerr := readLine(dec)
+		if rerr != nil {
+			break // EOF: only clean once the exit came through first
+		}
+		in, derr := ctl.DecodeIncoming(line)
+		require.NoError(t, derr)
+		if in.Event != nil && in.Event.Name == ctl.EventSessionExit {
+			sawExit = true
+		}
+	}
+	assert.True(t, sawExit)
 }
 
 func TestControlHelloAnnouncesIdentity(t *testing.T) {

@@ -36,8 +36,9 @@ const (
 	// and byte caps live beside it in control_conn.go.
 	connQueue = 256
 
-	// connDrainWait bounds the flush of queued lines once a connection stops,
-	// so shutdown never hangs on a peer that stopped reading.
+	// connDrainWait bounds Close's wait for every connection's writer to drain
+	// its staged lines (session.exit included) into the socket, so a peer that
+	// stopped reading never extends shutdown past the bound.
 	connDrainWait = 250 * time.Millisecond
 
 	// laneQuiesceWait bounds the shutdown wait for the executor and state lanes
@@ -419,9 +420,10 @@ func (s *controlServer) remove(c *controlConn) {
 
 // Close stops accepting, drains the executor and state lanes a bounded while
 // so no verb can publish after the end, announces session.exit to every
-// connection, flushes it a bounded while, then unlinks this instance's own
-// socket and registry. Only paths carrying this token are ever removed, so a
-// newer instance's files are untouchable. Idempotent.
+// connection, joins each writer a bounded while so the staged lines reach the
+// wire before main can exit, then unlinks this instance's own socket and
+// registry. Only paths carrying this token are ever removed, so a newer
+// instance's files are untouchable. Idempotent.
 func (s *controlServer) Close(reason string) {
 	s.mu.Lock()
 	if s.closed {
@@ -450,8 +452,26 @@ func (s *controlServer) Close(reason string) {
 	for _, c := range conns {
 		c.detach(true)
 	}
+	joinWriters(conns)
 	_ = os.Remove(sock)
 	_ = os.Remove(reg)
+}
+
+// joinWriters waits for every detached connection's writer loop to return,
+// under one overall bound: each staged line, exit included, is on the wire or
+// its write deadline expired before Close returns. A stalled peer's writer
+// keeps grinding past the bound and loses fail-open, dropped by process exit
+// like any other consumer that stopped reading.
+func joinWriters(conns []*controlConn) {
+	timer := time.NewTimer(connDrainWait)
+	defer timer.Stop()
+	for _, c := range conns {
+		select {
+		case <-c.wrote:
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 // entryAppended announces one transcript entry written after attach. Wired

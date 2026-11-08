@@ -46,7 +46,7 @@ const (
 // Every line, event or reply, passes the stage in arrival order, so the socket
 // carries one total order matching the hub's seq. A peer that stops reading
 // backs the writer up until the stage bound trips and drops the connection;
-// nothing on the session side ever blocks on it.
+// nothing on the session side ever blocks on it but Close's bounded flush join.
 type controlConn struct {
 	srv   *controlServer
 	conn  net.Conn
@@ -129,15 +129,18 @@ func (c *controlConn) reply(id string, seq uint64, result any, rerr *ctl.Error) 
 // reporting false once the connection is detached or a bound tripped: the
 // hard caps always drop, the soft item count drops only when the writer has
 // not flushed for controlStallWait, which is the peer-stopped-reading shape.
-// reserved bypasses every bound: the exit event can never be the drop.
+// reserved bypasses every bound: the exit event can never be the drop. The
+// detach check shares the stage lock with close(done), so a line stages
+// entirely before Close's final drain or refuses after it, never stranding
+// between the two.
 func (c *controlConn) stageOutgoing(out outgoing, reserved bool) bool {
+	c.stageMu.Lock()
+	defer c.stageMu.Unlock()
 	select {
 	case <-c.done:
 		return false
 	default:
 	}
-	c.stageMu.Lock()
-	defer c.stageMu.Unlock()
 	size := out.size()
 	if !reserved {
 		if len(c.stage) >= stageHardItems || c.stageBytes+size > stageHardBytes {
@@ -174,14 +177,19 @@ func (o outgoing) size() int {
 	return len(o.reply.Result) + 64
 }
 
-// detach tears the connection down exactly once. flush keeps the socket open
-// for a bounded drain of staged lines (session.exit); otherwise the peer is
-// gone and the socket closes at once.
+// detach tears the connection down exactly once. flush leaves the socket open
+// while the writer drains its staged lines (session.exit), with Close joining
+// that a bounded while; otherwise the peer is gone and the socket closes at
+// once.
 func (c *controlConn) detach(flush bool) {
 	c.once.Do(func() {
 		c.srv.hub.evUnlisten(c.lis)
 		c.srv.remove(c)
+		// under the stage lock, so a line stages entirely before done closes or
+		// refuses after it: the writer's final drain sees every staged line
+		c.stageMu.Lock()
 		close(c.done)
+		c.stageMu.Unlock()
 		if !flush {
 			_ = c.conn.Close()
 			return
@@ -218,8 +226,9 @@ func (c *controlConn) readLoop() {
 }
 
 // writeLoop drains the stage to the socket, one flush per batch, so a burst
-// publisher cannot outpace the syscall rate. After detach it flushes what
-// remains for at most connDrainWait, then lets the socket close.
+// publisher cannot outpace the syscall rate. After detach it runs one final
+// drain: staging ended with the barrier, so that pass covers every line that
+// will ever stage, and each blocked flush fails at its write deadline.
 func (c *controlConn) writeLoop() {
 	defer close(c.wrote)
 	for {
@@ -230,19 +239,8 @@ func (c *controlConn) writeLoop() {
 				return
 			}
 		case <-c.done:
-			timer := time.NewTimer(connDrainWait)
-			defer timer.Stop()
-			for {
-				select {
-				case <-c.kick:
-					if err := c.drain(); err != nil {
-						return
-					}
-				case <-timer.C:
-					_ = c.flushBuffer()
-					return
-				}
-			}
+			_ = c.drain()
+			return
 		}
 	}
 }
