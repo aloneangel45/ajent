@@ -8,9 +8,9 @@ import (
 )
 
 // lockWriter takes the transcript's exclusive advisory flock, blocking until a
-// concurrent appender or repair lets go. Only EINTR is retried; any other error
-// returns as is, since a filesystem without flock degrades to whole-line O_APPEND
-// writes rather than failing appends. flock is advisory and per open file
+// concurrent appender or repair lets go. Only EINTR is retried and any other
+// error fails the append outright: no whole-line fallback below flock, since
+// sessions assume a local filesystem. flock is advisory and per open file
 // description, so it serializes cross-process writers without locking readers.
 func lockWriter(f *os.File) error {
 	for {

@@ -63,12 +63,14 @@ deliberately no second dispatch, so remote behavior shares local behavior and it
 and a controller cannot reach a state the operator cannot produce by hand. Four rules
 keep that single path honest under concurrent controllers.
 
-- **Mutating verbs run on one lane.** Submit, interrupt, editor typing, recall,
+- **Mutating verbs run on one lane.** Submit, interrupt, recall,
   rewind and mode cycle are serialized, so guards revalidate at execution time rather
   than at request time and a reply follows the effects it acknowledges. Interrupts jump
   the queue, so Esc never waits behind a queued rewind. The lane only orders and
   validates, then calls the keyboard's implementation, and the prompt pump stays
-  the only turn starter. A submit that finds the pump's bounded queue full
+  the only turn starter. Editor-typed lines ride that pump instead of this lane,
+  their dispatch ordered against branch switches by the generation checks below.
+  A submit that finds the pump's bounded queue full
   refuses with a retryable code instead of parking the lane behind it.
 - **Branch switches share one state lane with dispatch.** Rewind, fork and the
   compactor's append-then-swap hold the state lane across their whole
@@ -171,6 +173,15 @@ beside replay in `pkg/session`) feeds both. No event outside that family may mov
 The ephemeral family is everything else (stream deltas, dialogs, queue rows, transient
 notices) and is governed by the watermark alone, never reconciled against the file, with
 one exception below.
+
+**Publishing costs what watching costs.** A publish with no listener encodes nothing and
+spends no number, so the numbers stay dense over what subscribers received rather than
+over mutations (seat release already spent none). The view-model update never skips, so
+a snapshot stays the freshest truth a reconnecting client reconciles toward. Encoding
+stays out of the critical section where ordering allows it: stream deltas encode before
+the hub lock, and one shared frame per event encodes its wire line once, for whichever
+connection writer drains it first, so fanout to many observers costs one encode plus one
+buffer write each.
 
 **Open dialogs are state, not paint.** A dialog holding the run cannot be an event a late
 arrival misses, so every snapshot lists the interactions still open, exactly as their
@@ -335,9 +346,10 @@ prompts verbatim, so redaction covers the live surfaces only.
 3. One seat at a time, released by disconnection or yield. Observers never mutate, and local
    keys always work.
 4. One number space orders events and reply watermarks alike. Commit order equals event
-   order, so a snapshot and a live stream reconcile by one rule. A snapshot field either
-   has a change event or sits on the named poll-only list, and the hub test holds that
-   inventory.
+   order, so a snapshot and a live stream reconcile by one rule. Events with no listener
+   consume no number, so the space stays dense over what subscribers received. A snapshot
+   field either has a change event or sits on the named poll-only list, and the hub test
+   holds that inventory.
 5. Committed content is entry appends plus branch changes, reconciled by entry id alone.
    Everything else is ephemeral, governed by the watermark and never reconciled against the
    file, except open dialogs: they hold the run, so every snapshot lists them; the seat

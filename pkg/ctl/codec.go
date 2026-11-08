@@ -21,15 +21,24 @@ func NewEncoder(w io.Writer) *Encoder {
 	return &Encoder{w: w}
 }
 
+// EncodeLine marshals v into one newline-terminated wire line.
+func EncodeLine(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err // an unencodable value is dropped, never a corrupted line
+	}
+	return append(b, '\n'), nil
+}
+
 // Encode marshals v and writes it as one line.
 func (e *Encoder) Encode(v any) error {
-	line, err := json.Marshal(v)
+	line, err := EncodeLine(v)
 	if err != nil {
-		return err // an unencodable value is dropped, never a corrupted line
+		return err
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	_, werr := e.w.Write(append(line, '\n'))
+	_, werr := e.w.Write(line)
 	return werr
 }
 

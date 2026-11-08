@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-analyze/bulk"
 
@@ -168,11 +169,32 @@ type sessionHub struct {
 	// retained events past the live fanout.
 	evSeq  uint64
 	evSubs []*evListener
+	// evLive mirrors len(evSubs) without the lock, so an unwatched publish
+	// costs one atomic load instead of a payload encode.
+	evLive atomic.Int32
 }
 
 // evListener is one registered event delivery func, address-identified so it
 // can be dropped by handle.
-type evListener struct{ deliver func(ctl.Event) }
+type evListener struct{ deliver func(*evFrame) }
+
+// evFrame is one published event shared by every connection receiving it: the
+// wire line encodes at most once, for whichever writer drains it first, so
+// fanout costs one encode however many observers hold it. Immutable after the
+// hub hands it to its listeners.
+type evFrame struct {
+	ev   ctl.Event
+	once sync.Once
+	line []byte
+	err  error
+}
+
+// bytes returns the event's newline-terminated encoding, encoding it on first
+// use. Concurrent drains share the one result.
+func (f *evFrame) bytes() ([]byte, error) {
+	f.once.Do(func() { f.line, f.err = ctl.EncodeLine(f.ev) })
+	return f.line, f.err
+}
 
 // newSessionHub builds the control plane. Construction is initial state, not a
 // change, so nothing publishes here.
@@ -226,8 +248,7 @@ func (h *sessionHub) setSessionName(name string) {
 	h.sessionName = name
 	var obs func()
 	if changed {
-		raw := ctl.EncodeData(ctl.SessionRenamedData{Name: name})
-		h.publishLocked(ctl.EventSessionRenamed, raw)
+		h.publishLocked(ctl.EventSessionRenamed, ctl.SessionRenamedData{Name: name})
 		obs = h.renameObs
 	}
 	h.mu.Unlock()
@@ -248,8 +269,7 @@ func (h *sessionHub) setHead(id, cause string) {
 	}
 	from := h.headID
 	h.headID = id
-	raw := ctl.EncodeData(ctl.BranchChangedData{From: from, Head: id, Cause: cause})
-	h.publishLocked(ctl.EventBranchChanged, raw)
+	h.publishLocked(ctl.EventBranchChanged, ctl.BranchChangedData{From: from, Head: id, Cause: cause})
 	h.mu.Unlock()
 }
 
@@ -298,24 +318,39 @@ func (h *sessionHub) observers() []agent.Sink {
 // delivery share one critical section, so a connection's lines can never arrive
 // out of seq order and commit order equals seq order by construction. Delivery
 // is non-blocking by contract: a stage append or an asynchronous drop, so a
-// slow or gone consumer never stalls the caller.
+// slow or gone consumer never stalls the caller. With no listener the call is
+// free: no encode, no seq, matching what subscribers receive.
 func (h *sessionHub) publish(name string, data any) {
+	if h.evLive.Load() == 0 {
+		return
+	}
 	// encoded before the lock: stream deltas ride this path per sink call and
 	// must not serialize behind every other hub surface
 	raw := ctl.EncodeData(data)
 	h.mu.Lock()
-	h.publishLocked(name, raw)
+	h.stampLocked(name, raw)
 	h.mu.Unlock()
 }
 
-// publishLocked stamps and delivers one encoded event. Caller holds h.mu; a
-// mutation and its publish must share the caller's one critical section so the
-// snapshot can never name a state that never existed.
-func (h *sessionHub) publishLocked(name string, raw json.RawMessage) {
+// publishLocked stamps and delivers one event from its payload. Caller holds
+// h.mu; a mutation and its publish must share the caller's one critical
+// section so the snapshot can never name a state that never existed. With no
+// listener nothing encodes and no seq is spent, as seat release already spends
+// none: the numbers name exactly what subscribers received.
+func (h *sessionHub) publishLocked(name string, data any) {
+	if len(h.evSubs) == 0 {
+		return
+	}
+	h.stampLocked(name, ctl.EncodeData(data))
+}
+
+// stampLocked assigns the next seq to one encoded event and hands it to every
+// listener as one shared frame. Caller holds h.mu.
+func (h *sessionHub) stampLocked(name string, raw json.RawMessage) {
 	h.evSeq++
-	ev := ctl.Event{Name: name, Seq: h.evSeq, Data: raw}
+	f := &evFrame{ev: ctl.Event{Name: name, Seq: h.evSeq, Data: raw}}
 	for _, l := range h.evSubs {
-		l.deliver(ev)
+		l.deliver(f)
 	}
 }
 
@@ -328,11 +363,12 @@ func (h *sessionHub) evWatermark() uint64 {
 
 // evListen registers one connection's delivery func, reporting the seq it is
 // current through: events past it arrive via the listener.
-func (h *sessionHub) evListen(f func(ctl.Event)) (*evListener, uint64) {
+func (h *sessionHub) evListen(f func(*evFrame)) (*evListener, uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	l := &evListener{deliver: f}
 	h.evSubs = append(h.evSubs, l)
+	h.evLive.Store(int32(len(h.evSubs)))
 	return l, h.evSeq
 }
 
@@ -341,6 +377,7 @@ func (h *sessionHub) evUnlisten(l *evListener) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.evSubs = slices.DeleteFunc(h.evSubs, func(x *evListener) bool { return x == l })
+	h.evLive.Store(int32(len(h.evSubs)))
 }
 
 // notice publishes one transient notice line, key "" marking an unkeyed one.
@@ -399,7 +436,7 @@ func (h *sessionHub) publishModelLocked(m hubModel) {
 
 // publishStatusLocked publishes one status-family change. Caller holds h.mu.
 func (h *sessionHub) publishStatusLocked(d ctl.StatusData) {
-	h.publishLocked(ctl.EventStatus, ctl.EncodeData(d))
+	h.publishLocked(ctl.EventStatus, d)
 }
 
 // setQueued remembers the pending-prompt rows, oldest first, the view model's
@@ -409,9 +446,7 @@ func (h *sessionHub) publishStatusLocked(d ctl.StatusData) {
 func (h *sessionHub) setQueued(rows []ctl.QueueRow) {
 	h.mu.Lock()
 	h.vm.queued = slices.Clone(rows)
-	h.publishLocked(ctl.EventQueued, ctl.EncodeData(ctl.QueuedData{
-		Rows: redactQueueRows(rows),
-	}))
+	h.publishLocked(ctl.EventQueued, ctl.QueuedData{Rows: redactQueueRows(rows)})
 	h.mu.Unlock()
 }
 
@@ -429,7 +464,7 @@ func (h *sessionHub) setIdle(idle bool) {
 	h.mu.Lock()
 	if h.vm.idle != idle {
 		h.vm.idle = idle
-		h.publishLocked(ctl.EventIdle, ctl.EncodeData(ctl.IdleData{Idle: idle}))
+		h.publishLocked(ctl.EventIdle, ctl.IdleData{Idle: idle})
 	}
 	h.mu.Unlock()
 }
@@ -444,7 +479,7 @@ func (h *sessionHub) setActivity(key, text string, rank int) {
 		h.vm.actSeq++
 		h.vm.activity[key] = hubActivity{Key: key, Text: text, Rank: rank, seq: h.vm.actSeq}
 	}
-	h.publishLocked(ctl.EventActivity, ctl.EncodeData(ctl.ActivityData{Key: key, Text: text, Rank: rank}))
+	h.publishLocked(ctl.EventActivity, ctl.ActivityData{Key: key, Text: text, Rank: rank})
 	h.mu.Unlock()
 }
 
@@ -454,7 +489,7 @@ func (h *sessionHub) setActivity(key, text string, rank int) {
 func (h *sessionHub) setContext(c tokens.ContextState) {
 	h.mu.Lock()
 	h.vm.context = c
-	h.publishLocked(ctl.EventContext, ctl.EncodeData(contextWire(c)))
+	h.publishLocked(ctl.EventContext, contextWire(c))
 	h.mu.Unlock()
 }
 
@@ -465,7 +500,7 @@ func (h *sessionHub) setPermissionMode(m permit.Mode) {
 	h.mu.Lock()
 	name := m.String()
 	h.vm.permission = name
-	h.publishLocked(ctl.EventPermission, ctl.EncodeData(ctl.PermissionData{Mode: name}))
+	h.publishLocked(ctl.EventPermission, ctl.PermissionData{Mode: name})
 	h.mu.Unlock()
 }
 
@@ -495,7 +530,7 @@ func (h *sessionHub) refreshTools() {
 	rows := toolSnapshot(reg)
 	h.mu.Lock()
 	h.vm.tools = rows
-	h.publishLocked(ctl.EventTools, ctl.EncodeData(ctl.ToolsData{Rows: ctlTools(rows)}))
+	h.publishLocked(ctl.EventTools, ctl.ToolsData{Rows: ctlTools(rows)})
 	h.mu.Unlock()
 }
 

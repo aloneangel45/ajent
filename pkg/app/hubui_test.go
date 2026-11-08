@@ -38,9 +38,9 @@ type emitLog struct {
 
 // attach subscribes the log to the hub's event fanout.
 func (l *emitLog) attach(hub *sessionHub) {
-	hub.evListen(func(ev ctl.Event) {
+	hub.evListen(func(f *evFrame) {
 		l.mu.Lock()
-		l.evs = append(l.evs, ev)
+		l.evs = append(l.evs, f.ev)
 		l.mu.Unlock()
 	})
 }
@@ -127,22 +127,22 @@ func (l *emitLog) queuesSeen() [][]ctl.QueueRow {
 
 // pipeUI opens a plain-mode TUI over pipes whose output drains to a buffer,
 // for wrapper tests that assert what the raw surface committed.
-func pipeUI(t *testing.T) (*tui.UI, func() string) {
-	t.Helper()
+func pipeUI(tb testing.TB) (*tui.UI, func() string) {
+	tb.Helper()
 
 	inR, inW, err := os.Pipe()
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	outR, outW, err := os.Pipe()
-	require.NoError(t, err)
-	t.Cleanup(func() {
+	require.NoError(tb, err)
+	tb.Cleanup(func() {
 		_ = inR.Close()
 		_ = inW.Close()
 		_ = outR.Close()
 		_ = outW.Close()
 	})
 	ui, err := tui.New(tui.Options{In: inR, Out: outW, Mode: tui.ModePlain})
-	require.NoError(t, err)
-	t.Cleanup(ui.Close)
+	require.NoError(tb, err)
+	tb.Cleanup(ui.Close)
 
 	var mu sync.Mutex
 	var sb strings.Builder

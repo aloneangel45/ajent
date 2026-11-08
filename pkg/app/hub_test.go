@@ -666,6 +666,79 @@ func TestHubContextMirrorsSink(t *testing.T) {
 	assert.Equal(t, want.Used, hub.Snapshot().Context.Used)
 }
 
+// Unwatched publishes update the view model without encoding an event or
+// spending a seq, and the seq space stays dense over what subscribers receive.
+func TestHubPublishWithoutListeners(t *testing.T) {
+	t.Parallel()
+
+	term, _ := pipeUI(t)
+	hub := newTestHub(term)
+
+	hub.setContext(tokens.ContextState{Used: 40, Window: 64000})
+	hub.publish("marker", map[string]int{"i": 1})
+	assert.Equal(t, uint64(0), hub.evWatermark())
+	assert.Equal(t, 40, hub.Snapshot().Context.Used) // the vm copy moved anyway
+
+	log := &emitLog{}
+	log.attach(hub)
+	hub.setContext(tokens.ContextState{Used: 90, Window: 64000})
+	require.Eventually(t, func() bool { return len(log.named(ctl.EventContext)) == 1 },
+		2*time.Second, 5*time.Millisecond)
+	assert.Equal(t, uint64(1), hub.evWatermark()) // the skipped publish spent nothing
+	assert.Equal(t, uint64(1), log.named(ctl.EventContext)[0].Seq)
+}
+
+// Every listener receives one and the same frame for one publish, and its
+// wire line encodes once no matter how many writers drain it.
+func TestEvFrameBytes(t *testing.T) {
+	t.Parallel()
+
+	term, _ := pipeUI(t)
+	hub := newTestHub(term)
+	var mu sync.Mutex
+	frames := make([]*evFrame, 0, 3)
+	for range 3 {
+		hub.evListen(func(f *evFrame) {
+			mu.Lock()
+			frames = append(frames, f)
+			mu.Unlock()
+		})
+	}
+	hub.publish("marker", map[string]int{"i": 7})
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(frames) == 3
+	}, 2*time.Second, 5*time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	for _, f := range frames[1:] {
+		assert.Same(t, frames[0], f) // one frame object per publish, shared
+	}
+
+	first, err := frames[0].bytes()
+	require.NoError(t, err)
+	assert.Equal(t, byte('\n'), first[len(first)-1]) // the framing byte JSONEq cannot see
+	assert.JSONEq(t, `{"event":"marker","seq":1,"data":{"i":7}}`, string(first[:len(first)-1]))
+
+	var wg sync.WaitGroup
+	lines := make([][]byte, 8)
+	for i := range lines {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			line, lerr := frames[0].bytes()
+			assert.NoError(t, lerr)
+			lines[n] = line
+		}(i)
+	}
+	wg.Wait()
+	for _, line := range lines {
+		assert.Equal(t, first, line)
+	}
+}
+
 func TestHubSnapshotConsistentUnderMutation(t *testing.T) {
 	t.Parallel()
 

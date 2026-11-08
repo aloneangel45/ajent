@@ -35,6 +35,18 @@ func TestCodecRoundTrip(t *testing.T) {
 	assert.ErrorIs(t, dec.Decode(&req), io.EOF)
 }
 
+func TestEncodeLine(t *testing.T) {
+	t.Parallel()
+
+	line, err := EncodeLine(NewEvent(EventTextEnd, 3, nil))
+	require.NoError(t, err)
+	assert.Equal(t, byte('\n'), line[len(line)-1]) // the framing byte JSONEq cannot see
+	assert.JSONEq(t, `{"event":"text.end","seq":3,"data":null}`, string(line[:len(line)-1]))
+
+	_, err = EncodeLine(make(chan int))
+	assert.Error(t, err) // an unencodable value is dropped, never a corrupted line
+}
+
 func TestDecoder(t *testing.T) {
 	t.Parallel()
 

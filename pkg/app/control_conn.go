@@ -14,16 +14,31 @@ import (
 )
 
 // outgoing is one queued socket line: an event or a request reply, never both.
+// The event is a shared frame, so one publish encodes its line once across
+// every connection that receives it.
 type outgoing struct {
-	event *ctl.Event
+	event *evFrame
 	reply *ctl.Reply
 }
 
-func (o outgoing) encode(enc *ctl.Encoder) error {
-	if o.event != nil {
-		return enc.Encode(o.event)
+// write emits one line into w.
+func (o outgoing) write(w *bufio.Writer) error {
+	line, err := o.line()
+	if err != nil {
+		return err
 	}
-	return enc.Encode(o.reply)
+	_, werr := w.Write(line)
+	return werr
+}
+
+// line returns the outgoing's newline-terminated encoding: the event's shared
+// line verbatim, a reply encoded here since replies are per connection, never
+// shared.
+func (o outgoing) line() ([]byte, error) {
+	if o.event != nil {
+		return o.event.bytes()
+	}
+	return ctl.EncodeLine(o.reply)
 }
 
 // Stage bounds: the soft item count where a stalled writer is checked, and the
@@ -51,7 +66,6 @@ type controlConn struct {
 	srv   *controlServer
 	conn  net.Conn
 	bw    *bufio.Writer
-	enc   *ctl.Encoder
 	done  chan struct{} // closed on detach: nothing further is accepted
 	wrote chan struct{} // closed when the writer loop returns
 	once  sync.Once
@@ -70,7 +84,7 @@ type controlConn struct {
 func newControlConn(srv *controlServer, nc net.Conn) *controlConn {
 	bw := bufio.NewWriterSize(nc, 4096)
 	c := &controlConn{
-		srv: srv, conn: nc, bw: bw, enc: ctl.NewEncoder(bw),
+		srv: srv, conn: nc, bw: bw,
 		done: make(chan struct{}), wrote: make(chan struct{}),
 		kick: make(chan struct{}, 1),
 	}
@@ -78,7 +92,7 @@ func newControlConn(srv *controlServer, nc net.Conn) *controlConn {
 	c.lis, seq = srv.hub.evListen(c.deliver)
 	c.lastWrite.Store(time.Now().UnixNano()) // the stall window starts at attach
 	snap := srv.hub.Snapshot()
-	_ = c.enc.Encode(ctl.NewEvent(ctl.EventHello, seq, ctl.Hello{
+	if line, err := ctl.EncodeLine(ctl.NewEvent(ctl.EventHello, seq, ctl.Hello{
 		Protocol:  ctl.Protocol,
 		Session:   ctl.Session{ID: snap.SessionID, Name: snap.SessionName},
 		Workspace: snap.Workspace, Cwd: snap.Cwd,
@@ -86,7 +100,9 @@ func newControlConn(srv *controlServer, nc net.Conn) *controlConn {
 		PID: os.Getpid(), Version: version.Version,
 		TranscriptPath: srv.transcriptPath,
 		Token:          srv.token,
-	}))
+	})); err == nil {
+		_, _ = bw.Write(line)
+	}
 	_ = c.flushBuffer() // the hello must land before anything can queue behind it
 	return c
 }
@@ -97,12 +113,13 @@ func (c *controlConn) start() {
 	go c.writeLoop()
 }
 
-// deliver stages one event. It runs on the publishing goroutine, under the
-// hub's lock, so it never blocks: a full stage drops the connection
-// asynchronously. The exit event stages past every bound, so an attached
-// terminal can always say "session ended" definitively.
-func (c *controlConn) deliver(ev ctl.Event) {
-	if !c.stageOutgoing(outgoing{event: &ev}, ev.Name == ctl.EventSessionExit) {
+// deliver stages one event, sharing its frame with every other connection. It
+// runs on the publishing goroutine, under the hub's lock, so it never blocks:
+// a full stage drops the connection asynchronously. The exit event stages past
+// every bound, so an attached terminal can always say "session ended"
+// definitively.
+func (c *controlConn) deliver(f *evFrame) {
+	if !c.stageOutgoing(outgoing{event: f}, f.ev.Name == ctl.EventSessionExit) {
 		go c.detach(false) // off the hub lock: detach unregisters under it
 	}
 }
@@ -172,7 +189,7 @@ func (c *controlConn) stalledLocked() bool {
 // size approximates one line's encoded weight for the byte bound.
 func (o outgoing) size() int {
 	if o.event != nil {
-		return len(o.event.Data) + 64
+		return len(o.event.ev.Data) + 64
 	}
 	return len(o.reply.Result) + 64
 }
@@ -206,8 +223,10 @@ func (c *controlConn) detach(flush bool) {
 // close that follows is the authoritative signal.
 func writeControlRefusal(nc net.Conn, reason error) {
 	bw := bufio.NewWriterSize(nc, 512)
-	_ = ctl.NewEncoder(bw).Encode(ctl.NewEvent(ctl.EventRefused, 0,
-		ctl.RefusedData{Reason: reason.Error()}))
+	if line, err := ctl.EncodeLine(ctl.NewEvent(ctl.EventRefused, 0,
+		ctl.RefusedData{Reason: reason.Error()})); err == nil {
+		_, _ = bw.Write(line)
+	}
 	_ = bw.Flush()
 }
 
@@ -245,8 +264,8 @@ func (c *controlConn) writeLoop() {
 	}
 }
 
-// drain encodes everything staged so far, one batch per pass. The write
-// deadline spans the whole batch (encoding into the buffer can flush
+// drain writes everything staged so far, one batch per pass. The write
+// deadline spans the whole batch (writing into the buffer can flush
 // mid-line), and each pass stamps the progress the stall check reads. It
 // reports the first write error.
 func (c *controlConn) drain() error {
@@ -264,7 +283,7 @@ func (c *controlConn) drain() error {
 		_ = c.conn.SetWriteDeadline(time.Now().Add(controlWriteWait))
 		var err error
 		for _, out := range batch {
-			if err = out.encode(c.enc); err != nil {
+			if err = out.write(c.bw); err != nil {
 				break
 			}
 		}
